@@ -35,9 +35,9 @@ def main(config):
     # Initialize a GFlowNet agent from the configuration file
     gflownet = gflownet_from_config(config)
 
-    # Train GFlowNet with the selected backend
+    #! gflownet.train()
     trainer = get_trainer(config.trainer.mode)
-    trainer(gflownet, config)
+    trainer(gflownet)
 
     # Sample from trained GFlowNet
     # TODO: move to method in GFlowNet agent, like sample_and_log()

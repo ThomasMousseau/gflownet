@@ -5,7 +5,7 @@ JAX trainer entry point (placeholder for upcoming port).
 from typing import Any
 
 
-def run(agent, config: Any) -> None:
+def train(agent) -> None:
     """
     Placeholder implementation for the JAX trainer.
     """
