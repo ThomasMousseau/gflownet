@@ -26,6 +26,7 @@ class TrainingState:
     clip_grad_norm: float
     garbage_collection_period: int
     use_context: bool
+    pbar: Any
 
 def train_step(state: TrainingState, batch: Any) -> Tuple[TrainingState, dict]:
     """
@@ -83,7 +84,7 @@ def train_step(state: TrainingState, batch: Any) -> Tuple[TrainingState, dict]:
         state.logger,
         state.iteration,
         state.use_context,
-        pbar=None,  # Pass pbar if needed for progress bar updates
+        pbar=state.pbar, 
     )
     metrics.update({"log": log_metrics})
     
@@ -135,6 +136,7 @@ def build_state_from_agent(agent: Any) -> TrainingState:
         clip_grad_norm=agent.clip_grad_norm,
         garbage_collection_period=agent.garbage_collection_period,
         use_context=agent.use_context,
+        pbar=None,  # Initialize later in train function
     )
 
 def create_batch(agent: Any) -> Any:
@@ -187,6 +189,7 @@ def train(agent: Any) -> TrainingState:
         
         # Update progress bar (assuming logger handles it via metrics)
         # If needed, call state.logger.progressbar_update(pbar, ...)
+        pbar.update(1)
     
     # Final save (mirroring original)
     state.logger.save_checkpoint(
