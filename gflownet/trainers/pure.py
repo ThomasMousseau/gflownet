@@ -5,6 +5,10 @@ import time
 import torch
 import gc
 
+import time
+from gflownet.utils.batch import Batch
+
+
 @dataclass
 class TrainingState:
     agent: Any  
@@ -27,6 +31,22 @@ class TrainingState:
     garbage_collection_period: int
     use_context: bool
     pbar: Any
+    rng_generator: Any
+    
+@dataclass
+class SamplingState:
+    n_forward: int
+    n_train: int
+    n_replay: int
+    env_maker: Any  
+    device: Any
+    float_type: Any
+    proxy: Any
+    buffer: Any
+    collect_reversed_logprobs: bool
+    train_sampling: str = "permutation"
+    replay_sampling: str = "permutation"
+    train: bool = True
 
 def train_step(state: TrainingState, batch: Any) -> Tuple[TrainingState, dict]:
     """
@@ -44,15 +64,15 @@ def train_step(state: TrainingState, batch: Any) -> Tuple[TrainingState, dict]:
         top_k_metrics = state.evaluator.eval_and_log_top_k(state.iteration)
         metrics.update({"top_k": top_k_metrics})
     
-    # Sample sub-batches and merge into batch
-    updated_batch = batch  # Assume batch is passed in; modify if needed
+
+    updated_batch = batch  
     for j in range(state.sttr):
-        sub_batch, times = state.agent.sample_batch(  # Assuming agent is accessible; adjust as needed
+        sub_batch, times = state.agent.sample_batch( 
             n_forward=state.batch_size.forward,
             n_train=state.batch_size.backward_dataset,
             n_replay=state.batch_size.backward_replay,
             collect_forwards_masks=True,
-            collect_backwards_masks=state.loss.requires_backward_policy(),  # Add to TrainingState if needed
+            collect_backwards_masks=state.loss.requires_backward_policy(),  
         )
         updated_batch.merge(sub_batch)
         metrics.update({"sample_times": times})
@@ -111,7 +131,7 @@ def train_step(state: TrainingState, batch: Any) -> Tuple[TrainingState, dict]:
     
     return updated_state, metrics
 
-def build_state_from_agent(agent: Any) -> TrainingState:
+def build_state_from_agent(agent: Any, config: Any) -> TrainingState:
     """
     Helper to initialize TrainingState from the agent.
     Adjust fields as needed based on agent's attributes.
@@ -136,7 +156,8 @@ def build_state_from_agent(agent: Any) -> TrainingState:
         clip_grad_norm=agent.clip_grad_norm,
         garbage_collection_period=agent.garbage_collection_period,
         use_context=agent.use_context,
-        pbar=None,  # Initialize later in train function
+        pbar=None,  
+        rng_generator=torch.Generator(device=agent.device).manual_seed(config.seed),  # Seed for reproducibility (JAX equivalent: jax.random.PRNGKey(config.seed))
     )
 
 def create_batch(agent: Any) -> Any:
@@ -151,13 +172,13 @@ def create_batch(agent: Any) -> Any:
         float_type=agent.float,
     )
 
-def train(agent: Any) -> TrainingState:
+def train(agent: Any, config: Any) -> TrainingState:
     """
     Pure-style training loop that calls train_step iteratively.
     Returns the final TrainingState after training.
     Handles side effects like logging, GC, and saving.
     """
-    state = build_state_from_agent(agent)
+    state = build_state_from_agent(agent, config)
     
     # Initialize progress bar (mirroring original)
     pbar = tqdm(

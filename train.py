@@ -37,7 +37,7 @@ def main(config):
 
     #! gflownet.train()
     trainer = get_trainer(config.trainer.mode)
-    trainer(gflownet)
+    trainer(gflownet, config)
 
     # Sample from trained GFlowNet
     # TODO: move to method in GFlowNet agent, like sample_and_log()

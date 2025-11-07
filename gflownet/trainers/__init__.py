@@ -7,7 +7,7 @@ from . import pure as pure_trainer
 if TYPE_CHECKING:  # pragma: no cover
     from gflownet.gflownet import GFlowNetAgent
 
-TrainerFn = Callable[["GFlowNetAgent"], Any]
+TrainerFn = Callable[["GFlowNetAgent", Any], Any]
 
 _TRAINERS: Dict[str, TrainerFn] = {
     "legacy": legacy_trainer.train,
