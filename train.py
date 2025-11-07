@@ -12,6 +12,7 @@ import hydra
 import pandas as pd
 from omegaconf import open_dict
 
+from gflownet.trainers import get_trainer
 from gflownet.utils.common import gflownet_from_config
 
 
@@ -34,8 +35,9 @@ def main(config):
     # Initialize a GFlowNet agent from the configuration file
     gflownet = gflownet_from_config(config)
 
-    # Train GFlowNet
-    gflownet.train()
+    # Train GFlowNet with the selected backend
+    trainer = get_trainer(config.trainer.mode)
+    trainer(gflownet, config)
 
     # Sample from trained GFlowNet
     # TODO: move to method in GFlowNet agent, like sample_and_log()
