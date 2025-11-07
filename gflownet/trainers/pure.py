@@ -63,7 +63,6 @@ def train_step(state: TrainingState, batch: Any) -> Tuple[TrainingState, dict]:
     if state.evaluator.should_eval_top_k(state.iteration):
         top_k_metrics = state.evaluator.eval_and_log_top_k(state.iteration)
         metrics.update({"top_k": top_k_metrics})
-    
 
     updated_batch = batch  
     for j in range(state.sttr):
@@ -208,9 +207,15 @@ def train(agent: Any, config: Any) -> TrainingState:
             )
             break
         
-        # Update progress bar (assuming logger handles it via metrics)
-        # If needed, call state.logger.progressbar_update(pbar, ...)
+        # Handle progress bar update from log metrics
+        if "log" in metrics and "progressbar_update" in metrics["log"]:
+            loss_val, rewards_list = metrics["log"]["progressbar_update"]
+            state.logger.progressbar_update(
+                pbar, loss_val, rewards_list, agent.jsd, state.use_context
+            )
+        
         pbar.update(1)
+        
     
     # Final save (mirroring original)
     state.logger.save_checkpoint(
