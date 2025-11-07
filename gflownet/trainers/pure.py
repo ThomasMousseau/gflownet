@@ -7,6 +7,7 @@ import gc
 
 @dataclass
 class TrainingState:
+    agent: Any  
     iteration: int
     n_train_steps: int
     sttr: Any
@@ -50,7 +51,7 @@ def train_step(state: TrainingState, batch: Any) -> Tuple[TrainingState, dict]:
             n_train=state.batch_size.backward_dataset,
             n_replay=state.batch_size.backward_replay,
             collect_forwards_masks=True,
-            collect_backwards_masks=state.collect_backwards_masks,  # Add to TrainingState if needed
+            collect_backwards_masks=state.loss.requires_backward_policy(),  # Add to TrainingState if needed
         )
         updated_batch.merge(sub_batch)
         metrics.update({"sample_times": times})
@@ -73,8 +74,21 @@ def train_step(state: TrainingState, batch: Any) -> Tuple[TrainingState, dict]:
             updated_batch.zero_logprobs()
     
     # Log training iteration (return metrics instead of mutating)
-    log_metrics = state.logger.log_train_iteration(None, losses, updated_batch, metrics.get("sample_times", {}))  # Pass pbar if needed
+    updated_buffer, log_metrics = pure_log_train_iteration(
+        losses,
+        updated_batch,
+        metrics.get("sample_times", {}),
+        state.buffer,
+        state.evaluator,
+        state.logger,
+        state.iteration,
+        state.use_context,
+        pbar=None,  # Pass pbar if needed for progress bar updates
+    )
     metrics.update({"log": log_metrics})
+    
+    updated_state = replace(state, buffer=updated_buffer)
+
     
     # Update times
     t1_iter = time.time()
@@ -102,6 +116,7 @@ def build_state_from_agent(agent: Any) -> TrainingState:
     Adjust fields as needed based on agent's attributes.
     """
     return TrainingState(
+        agent=agent,
         iteration=agent.it,
         n_train_steps=agent.n_train_steps,
         sttr=agent.sttr,
@@ -120,7 +135,6 @@ def build_state_from_agent(agent: Any) -> TrainingState:
         clip_grad_norm=agent.clip_grad_norm,
         garbage_collection_period=agent.garbage_collection_period,
         use_context=agent.use_context,
-        # Add any missing fields, e.g., collect_backwards_masks=agent.collect_backwards_masks
     )
 
 def create_batch(agent: Any) -> Any:
@@ -190,3 +204,80 @@ def train(agent: Any) -> TrainingState:
         state.logger.end()
     
     return state
+
+def pure_log_train_iteration(
+    losses: dict,
+    batch: Any,
+    times: dict,
+    buffer: Any,
+    evaluator: Any,
+    logger: Any,
+    iteration: int,
+    use_context: bool,
+    pbar: Any = None,
+) -> Tuple[Any, dict]:  # Returns updated buffer and metrics dict
+    """
+    Pure version of log_train_iteration.
+    Computes logging metrics and buffer updates without side effects.
+    Returns updated buffer and a dict of metrics for the caller to handle.
+    """
+    metrics = {}
+    t0_buffer = time.time()
+    
+    states_term = batch.get_terminating_states(sort_by="trajectory")
+    proxy_vals = batch.get_terminating_proxy_values(sort_by="trajectory")
+    
+    # Handle rewards (mirroring original logic)
+    if batch.rewards_available(log=False):
+        rewards = batch.get_terminating_rewards(sort_by="trajectory")
+    if batch.rewards_available(log=True):
+        logrewards = batch.get_terminating_rewards(sort_by="trajectory", log=True)
+    if not batch.rewards_available(log=False):
+        rewards = torch.exp(logrewards)
+    if not batch.rewards_available(log=True):
+        logrewards = torch.log(rewards)
+    
+    # Update buffers (return updated buffer instead of mutating)
+    actions_trajectories = batch.get_actions_trajectories()
+    updated_buffer = buffer  # Assume buffer is immutable or copy it
+    if buffer.use_main_buffer:
+        updated_buffer = buffer.add(  # Implement add to return new buffer
+            states_term, actions_trajectories, rewards, iteration, buffer="main"
+        )
+    updated_buffer = updated_buffer.add(
+        states_term, actions_trajectories, rewards, iteration, buffer="replay"
+    )
+    
+    t1_buffer = time.time()
+    times.update({"buffer": t1_buffer - t0_buffer})
+    
+    # Compute metrics for logging
+    t0_log = time.time()
+    if evaluator.should_log_train(iteration):
+        # logZ, trajectory lengths, etc. (compute without logging)
+        logz = None  # Compute if needed
+        _, trajectory_lengths = torch.unique(batch.get_trajectory_indices(), return_counts=True)
+        traj_length_mean = torch.mean(trajectory_lengths.float())
+        # ... other metrics ...
+        
+        # Collect metrics in dict
+        metrics.update({
+            "rewards": rewards,
+            "logrewards": logrewards,
+            "proxy_vals": proxy_vals,
+            "traj_length_mean": traj_length_mean,
+            # ... other metrics ...
+        })
+    
+    t1_log = time.time()
+    times.update({"log": t1_log - t0_log})
+    
+    # Progress bar update (return info for caller)
+    if pbar is not None:
+        metrics.update({"progressbar_update": (losses["all"].item(), rewards.tolist())})
+    
+    # Checkpoint saving (return flag/info for caller)
+    if evaluator.should_checkpoint(iteration):
+        metrics.update({"save_checkpoint": True})
+    
+    return updated_buffer, metrics
