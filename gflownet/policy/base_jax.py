@@ -7,33 +7,6 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 from omegaconf import OmegaConf
-
-
-# ---- Utilities --------------------------------------------------------------
-def to_jnp_dtype(precision) -> jnp.dtype:
-    if isinstance(precision, jnp.dtype):
-        return precision
-    if precision in (16, "16", "float16"):
-        return jnp.float16
-    if precision in (32, "32", "float32"):
-        return jnp.float32
-    if precision in (64, "64", "float64"):
-        return jnp.float64
-    raise ValueError("precision must be one of {16,32,64} or a jnp.dtype")
-
-
-# Optional simple leaky_relu if you don't want to import jax.nn
-def leaky_relu(x, negative_slope=0.01):
-    return jnp.where(x >= 0, x, negative_slope * x)
-
-
-class Activation(eqx.Module):
-    fn: Callable
-
-    def __call__(self, x):
-        return self.fn(x)
-
-
 # ---- Base -------------------------------------------------------------------
 class ModelBaseJAX(ABC):
     def __init__(self, config, env, device, float_precision, base=None):
@@ -145,7 +118,7 @@ class PolicyJAX(ModelBaseJAX):
             self.is_model = False
         elif self.type == "mlp":
             # You can use jax.nn.leaky_relu here
-            self.model = self.make_mlp(jax.nn.leaky_relu, key)
+            self.model = self.make_mlp(lambda x: jax.nn.leaky_relu(x, negative_slope=0.01), key)
             self.is_model = True
         else:
             raise RuntimeError("Policy model type not defined")
@@ -164,3 +137,23 @@ class PolicyJAX(ModelBaseJAX):
     def uniform_distribution(self, states: jnp.ndarray) -> jnp.ndarray:
         batch = states.shape[0]
         return jnp.ones((batch, self.output_dim), dtype=self.dtype)
+    
+# ---- Utilities --------------------------------------------------------------
+def to_jnp_dtype(precision) -> jnp.dtype:
+    if isinstance(precision, jnp.dtype):
+        return precision
+    if precision in (16, "16", "float16"):
+        return jnp.float16
+    if precision in (32, "32", "float32"):
+        return jnp.float32
+    if precision in (64, "64", "float64"):
+        return jnp.float64
+    raise ValueError("precision must be one of {16,32,64} or a jnp.dtype")
+
+class Activation(eqx.Module):
+    fn: Callable
+
+    def __call__(self, x):
+        return self.fn(x)
+
+
