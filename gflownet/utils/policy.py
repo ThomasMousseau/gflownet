@@ -30,4 +30,10 @@ def parse_policy_config(config: DictConfig, kind: str) -> Optional[DictConfig]:
     del policy_config.backward
     del policy_config.shared
 
+    # Set the target class based on trainer mode
+    if config.trainer.mode == "jax":
+        policy_config["_target_"] = "gflownet.policy.base_jax.PolicyJAX"
+    else:
+        policy_config["_target_"] = "gflownet.policy.base.Policy"
+
     return policy_config
