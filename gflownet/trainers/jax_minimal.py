@@ -6,7 +6,7 @@ Keeps PyTorch GFlowNetAgent but JITs gradient computation.
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax import jit, value_and_grad
+from jax import jit, value_and_grad, grad
 import optax
 from functools import partial
 from tqdm import tqdm
@@ -195,7 +195,7 @@ def jax_loss_wrapper(params, batch_arrays, loss_type='trajectorybalance', n_traj
             if logZ is None:
                 logZ = jnp.array(0.0)
             if logZ.ndim > 0:
-                logZ = logZ[0]  # Take first element if array
+                logZ = jnp.sum(logZ)  # Sum the logZ vector
             
             # Trajectory balance loss
             traj_loss = (log_pF - log_pB + log_R - logZ) ** 2
@@ -222,6 +222,9 @@ def jax_grad_step(params, opt_state, batch_arrays, optimizer, loss_type='traject
     loss_value, grads = value_and_grad(jax_loss_wrapper)(
         params, batch_arrays, loss_type=loss_type, n_trajs=n_trajs
     )
+    
+    # loss_value = jax_loss_wrapper(params, batch_arrays, loss_type=loss_type, n_trajs=n_trajs, debug=True)
+    # grads = grad(lambda p: jax_loss_wrapper(p, batch_arrays, loss_type=loss_type, n_trajs=n_trajs, debug=False))(params)
     
     # Apply optimizer update
     updates, new_opt_state = optimizer.update(grads, opt_state, params)
