@@ -34,19 +34,9 @@ def main(config):
     set_seeds(config.seed)
 
     #! Initialize a GFlowNet agent from the configuration file
-    if config.get("trainer").get("mode") == "jax":
-        trainer = get_trainer(config.trainer.mode)
-        trainer(None, config)
-    else: #! legacy and pure
-        gflownet = gflownet_from_config(config)
-        trainer = get_trainer(config.trainer.mode)
-        trainer(gflownet, config)
-
-
-    #! gflownet.train()
-    # gflownet = gflownet_from_config(config)
-    # trainer = get_trainer(config.trainer.mode)
-    # trainer(gflownet, config)
+    gflownet = gflownet_from_config(config)
+    trainer = get_trainer(config.trainer.mode)
+    trainer(gflownet, config)
 
     # Sample from trained GFlowNet
     # TODO: move to method in GFlowNet agent, like sample_and_log()

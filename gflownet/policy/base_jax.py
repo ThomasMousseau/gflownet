@@ -138,6 +138,16 @@ class PolicyJAX(ModelBaseJAX):
         batch = states.shape[0]
         return jnp.ones((batch, self.output_dim), dtype=self.dtype)
     
+    def parameters(self):
+        """
+        Returns an empty generator for compatibility with PyTorch parameter API.
+        JAX/Equinox models don't use the same parameter structure as PyTorch.
+        
+        For actual JAX training, use equinox.partition to get trainable/static parts.
+        """
+        # Return empty generator for compatibility
+        return iter([])
+    
 # ---- Utilities --------------------------------------------------------------
 def to_jnp_dtype(precision) -> jnp.dtype:
     if isinstance(precision, jnp.dtype):
