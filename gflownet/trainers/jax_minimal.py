@@ -57,15 +57,19 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
     actions_padded = [a + [0] * (max_len - len(a)) for a in actions_flat]
     actions = jnp.array(actions_padded, dtype=jnp.float32)
     
-    # Get rewards - CRITICAL: Check if proxy is set first
+    # Get rewards - Use terminating rewards only, as in original PyTorch
     if pytorch_batch.proxy is None:
         # If no proxy, use dummy rewards (all zeros)
         # This shouldn't happen in real training but helps with testing
         print("WARNING: Batch has no proxy, using zero rewards")
-        rewards = jnp.zeros(len(trajectory_indices))
+        terminating_rewards = jnp.zeros(pytorch_batch.get_n_trajectories())
     else:
-        rewards_tensor = pytorch_batch.get_rewards()
-        rewards = jnp.array(rewards_tensor.detach().cpu().numpy())
+        terminating_rewards_tensor = pytorch_batch.get_terminating_rewards(sort_by="trajectory")
+        terminating_rewards = jnp.array(terminating_rewards_tensor.detach().cpu().numpy())
+    
+    # For compatibility with existing code, also get all rewards (but we'll use terminating)
+    rewards_tensor = pytorch_batch.get_rewards()
+    rewards = jnp.array(rewards_tensor.detach().cpu().numpy())
     
     # Get logprobs (forward and backward)
     logprobs_fwd, _ = pytorch_batch.get_logprobs(backward=False)
@@ -77,6 +81,7 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
         'states': states,
         'actions': actions,
         'rewards': rewards,
+        'terminating_rewards': terminating_rewards,
         'logprobs': logprobs,
         'logprobs_rev': logprobs_rev,
         'trajectory_indices': trajectory_indices,
@@ -184,11 +189,8 @@ def jax_loss_wrapper(params, batch_arrays, loss_type='trajectorybalance', n_traj
             log_pF = jnp.sum(batch_arrays['logprobs'] * mask)
             log_pB = jnp.sum(batch_arrays['logprobs_rev'] * mask)
             
-            # Get terminal reward (last state in trajectory)
-            # We take the maximum reward in the trajectory (should be the terminal state)
-            rewards_traj = batch_arrays['rewards'] * mask
-            terminal_reward = jnp.max(rewards_traj)
-            log_R = jnp.log(terminal_reward + 1e-8)  # Safe log
+            # Get terminal reward (from terminating_rewards array)
+            log_R = jnp.log(batch_arrays['terminating_rewards'][traj_idx] + 1e-8)  # Safe log
             
             # LogZ (scalar or per-trajectory)
             logZ = params.get('logZ', jnp.array(0.0))
@@ -198,7 +200,7 @@ def jax_loss_wrapper(params, batch_arrays, loss_type='trajectorybalance', n_traj
                 logZ = jnp.sum(logZ)  # Sum the logZ vector
             
             # Trajectory balance loss
-            traj_loss = (log_pF - log_pB + log_R - logZ) ** 2
+            traj_loss = (log_pF - log_pB - log_R + logZ) ** 2
             return traj_loss
         
         # Compute loss for all trajectories
@@ -364,9 +366,8 @@ def train(agent, config):
         # })
 
         agent.logger.progressbar_update(
-            pbar, float(loss_value), batch_arrays['rewards'], agent.jsd, agent.use_context
+            pbar, float(loss_value), batch_arrays['terminating_rewards'], agent.jsd, agent.use_context
         )
-        pbar.update(1)
         
         # Evaluation
         if agent.evaluator.should_eval(iteration):
