@@ -14,7 +14,7 @@ class ModelBaseJAX(ABC):
         self.dtype: jnp.dtype = to_jnp_dtype(float_precision)
 
         # Env-provided dims / fixed distributions
-        self.state_dim: int = config.get("state_dim", int(env.policy_input_dim))
+        self.state_dim = config.get("state_dim", int(env.policy_input_dim))
         self.fixed_output = jnp.asarray(env.fixed_policy_output, dtype=self.dtype)
         self.random_output = jnp.asarray(env.random_policy_output, dtype=self.dtype)
         self.output_dim: int = int(self.fixed_output.shape[0])
@@ -172,7 +172,7 @@ def to_jnp_dtype(precision) -> jnp.dtype:
 class Activation(eqx.Module):
     fn: Callable
 
-    def __call__(self, x):
+    def __call__(self, x, *, key=None):
         return self.fn(x)
 
 

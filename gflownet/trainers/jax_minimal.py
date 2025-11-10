@@ -108,8 +108,7 @@ def convert_params_to_jax(agent, config, key):
         forward_config["_target_"] = "gflownet.policy.base_jax.PolicyJAX"
         # Add key for JAX initialization
         forward_config["key"] = None
-        # Ensure same state_dim as PyTorch policy
-        forward_config["state_dim"] = agent.forward_policy.state_dim
+        # Don't override state_dim - let it be determined from env.policy_input_dim
         
         jax_policy_f = instantiate(
             forward_config,
@@ -152,8 +151,7 @@ def convert_params_to_jax(agent, config, key):
         backward_config["_target_"] = "gflownet.policy.base_jax.PolicyJAX"
         # Add key for JAX initialization
         backward_config["key"] = None
-        # Ensure same state_dim as PyTorch policy
-        backward_config["state_dim"] = agent.backward_policy.state_dim
+        # Don't override state_dim - let it be determined from env.policy_input_dim
         # Don't instantiate yet
         backward_config["instantiate_now"] = False
         
@@ -175,7 +173,7 @@ def convert_params_to_jax(agent, config, key):
         
         # Sync parameters from PyTorch model
         if agent.backward_policy.is_model:
-            pt_params = dict(agent.backward_policy.model.named_parameters()) #! Missing 1 weight and 1 bias here!?!?!
+            pt_params = dict(agent.backward_policy.model.named_parameters())
             jax_policy_b.model = eqx.tree_at(lambda m: m.layers[0].weight, jax_policy_b.model, jnp.array(pt_params['0.0.weight'].detach().cpu().numpy()))
             jax_policy_b.model = eqx.tree_at(lambda m: m.layers[0].bias, jax_policy_b.model, jnp.array(pt_params['0.0.bias'].detach().cpu().numpy()))
             jax_policy_b.model = eqx.tree_at(lambda m: m.layers[2].weight, jax_policy_b.model, jnp.array(pt_params['0.2.weight'].detach().cpu().numpy()))
@@ -245,29 +243,33 @@ def apply_params_to_pytorch(jax_params, agent, jax_policies):
     import torch
     import numpy as np
     
-    # Update forward policy
-    if 'forward_policy_trainable' in jax_params and jax_params['forward_policy_trainable'] is not None:
-        jax_model = eqx.combine(jax_params['forward_policy_trainable'], jax_policies['forward_static'])
-        pt_model = agent.forward_policy.model
-        pt_model[0].weight.data = torch.tensor(jax_model.layers[0].weight).to(pt_model[0].weight.device)
-        pt_model[0].bias.data = torch.tensor(jax_model.layers[0].bias).to(pt_model[0].bias.device)
-        pt_model[2].weight.data = torch.tensor(jax_model.layers[2].weight).to(pt_model[2].weight.device)
-        pt_model[2].bias.data = torch.tensor(jax_model.layers[2].bias).to(pt_model[2].bias.device)
+    try:
+        # Update forward policy
+        if 'forward_policy_trainable' in jax_params and jax_params['forward_policy_trainable'] is not None:
+            jax_model = eqx.combine(jax_params['forward_policy_trainable'], jax_policies['forward_static'])
+            pt_model = agent.forward_policy.model
+            pt_model[0].weight.data = torch.tensor(jax_model.layers[0].weight).to(pt_model[0].weight.device)
+            pt_model[0].bias.data = torch.tensor(jax_model.layers[0].bias).to(pt_model[0].bias.device)
+            pt_model[2].weight.data = torch.tensor(jax_model.layers[2].weight).to(pt_model[2].weight.device)
+            pt_model[2].bias.data = torch.tensor(jax_model.layers[2].bias).to(pt_model[2].bias.device)
 
-    # Update backward policy
-    if 'backward_policy_trainable' in jax_params and jax_params['backward_policy_trainable'] is not None:
-        jax_model = eqx.combine(jax_params['backward_policy_trainable'], jax_policies['backward_static'])
-        pt_model = agent.backward_policy.model
-        pt_model[0].weight.data = torch.tensor(jax_model.layers[0].weight).to(pt_model[0].weight.device)
-        pt_model[0].bias.data = torch.tensor(jax_model.layers[0].bias).to(pt_model[0].bias.device)
-        pt_model[2].weight.data = torch.tensor(jax_model.layers[2].weight).to(pt_model[2].weight.device)
-        pt_model[2].bias.data = torch.tensor(jax_model.layers[2].bias).to(pt_model[2].bias.device)
-    
-    # Update logZ
-    if jax_params['logZ'] is not None and agent.logZ is not None:
-        agent.logZ.data = torch.from_numpy(
-            np.array(jax_params['logZ'])
-        ).to(agent.logZ.device, agent.logZ.dtype)
+        # Update backward policy
+        if 'backward_policy_trainable' in jax_params and jax_params['backward_policy_trainable'] is not None:
+            jax_model = eqx.combine(jax_params['backward_policy_trainable'], jax_policies['backward_static'])
+            pt_model = agent.backward_policy.model
+            pt_model[0].weight.data = torch.tensor(jax_model.layers[0].weight).to(pt_model[0].weight.device)
+            pt_model[0].bias.data = torch.tensor(jax_model.layers[0].bias).to(pt_model[0].bias.device)
+            pt_model[2].weight.data = torch.tensor(jax_model.layers[2].weight).to(pt_model[2].weight.device)
+            pt_model[2].bias.data = torch.tensor(jax_model.layers[2].bias).to(pt_model[2].bias.device)
+        
+        # Update logZ
+        if jax_params['logZ'] is not None and agent.logZ is not None:
+            agent.logZ.data = torch.from_numpy(
+                np.array(jax_params['logZ'])
+            ).to(agent.logZ.device, agent.logZ.dtype)
+    except Exception as e:
+        print(f"Warning: Failed to sync JAX parameters back to PyTorch: {e}")
+        print("Continuing with JAX-only training (parameters won't be synced back)")
 
 
 def train(agent, config):
@@ -348,7 +350,9 @@ def train(agent, config):
                     model_f = jax_policies['forward'].model
                 
                 # Compute logprobs using JAX forward
-                logits_f = model_f(batch_arrays['states_policy'])
+                # Use vmap to vectorize the model over the batch dimension
+                # Equinox models expect single inputs (features,), so we vmap over batch
+                logits_f = jax.vmap(model_f)(batch_arrays['states_policy'])
                 logprobs_f_all = jax.nn.log_softmax(logits_f, axis=1)
                 logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
                 log_pF = jnp.sum(logprobs_f * mask)
@@ -359,7 +363,8 @@ def train(agent, config):
                 else:
                     model_b = jax_policies['backward'].model
                 
-                logits_b = model_b(batch_arrays['states_policy'])
+                # Use vmap to vectorize the model over the batch dimension
+                logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
                 logprobs_b_all = jax.nn.log_softmax(logits_b, axis=1)
                 logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
                 log_pB = jnp.sum(logprobs_b * mask)
