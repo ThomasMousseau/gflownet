@@ -323,6 +323,7 @@ def train(agent, config):
     loss_type = config.loss.get('_target_', 'trajectorybalance').split('.')[-1].lower()
     
     # Define JAX loss wrapper with access to jax_policies
+    @partial(jit, static_argnames=['loss_type', 'n_trajs', 'debug'])
     def jax_loss_wrapper(params, batch_arrays, loss_type=loss_type, n_trajs=None, debug=False):
         """
         JAX-compatible loss computation.
@@ -383,15 +384,15 @@ def train(agent, config):
                 traj_loss = (logZ + log_pF - log_pB - log_R) ** 2
                 
                 # Debug print for first trajectory (will print every iteration)
-                if traj_idx == 0 and debug:
-                    print(f"JAX Debug traj 0: log_pF={log_pF:.4f}, log_pB={log_pB:.4f}, log_R={log_R:.4f}, logZ={logZ:.4f}, reward={batch_arrays['terminating_rewards'][traj_idx]:.4f}")
-                    print(f"JAX Debug loss components: logZ + log_pF - log_pB - log_R = {logZ + log_pF - log_pB - log_R:.4f}, squared = {traj_loss:.4f}")
+                # if traj_idx == 0 and debug:
+                #     print(f"JAX Debug traj 0: log_pF={log_pF:.4f}, log_pB={log_pB:.4f}, log_R={log_R:.4f}, logZ={logZ:.4f}, reward={batch_arrays['terminating_rewards'][traj_idx]:.4f}")
+                #     print(f"JAX Debug loss components: logZ + log_pF - log_pB - log_R = {logZ + log_pF - log_pB - log_R:.4f}, squared = {traj_loss:.4f}")
                 
                 return traj_loss
             
             # Compute loss for all trajectories
-            #!losses = jax.vmap(compute_traj_loss)(traj_indices)
-            losses = jnp.array([compute_traj_loss(tidx) for tidx in traj_indices])
+            losses = jax.vmap(compute_traj_loss)(traj_indices)
+            #!losses = jnp.array([compute_traj_loss(tidx) for tidx in traj_indices])
             
             
             # Mean loss
@@ -402,18 +403,19 @@ def train(agent, config):
             return jnp.mean((batch_arrays['logprobs'] - batch_arrays['logprobs_rev']) ** 2)
     
     # Define JAX grad step
+    @partial(jit, static_argnames=['loss_type', 'n_trajs'])
     def jax_grad_step(params, opt_state, batch_arrays, optimizer, loss_type=loss_type, n_trajs=None):
         """
         JIT-compiled gradient step.
         This is the ONLY function that needs to be pure JAX.
         """
         # Compute loss and gradients
-        # loss_value, grads = value_and_grad(jax_loss_wrapper)(
-        #     params, batch_arrays, loss_type=loss_type, n_trajs=n_trajs
-        # )
+        loss_value, grads = value_and_grad(jax_loss_wrapper)(
+            params, batch_arrays, loss_type=loss_type, n_trajs=n_trajs
+        )
         
-        loss_value = jax_loss_wrapper(params, batch_arrays, loss_type=loss_type, n_trajs=n_trajs, debug=True)
-        grads = grad(lambda p: jax_loss_wrapper(p, batch_arrays, loss_type=loss_type, n_trajs=n_trajs, debug=False))(params)
+        # loss_value = jax_loss_wrapper(params, batch_arrays, loss_type=loss_type, n_trajs=n_trajs, debug=True)
+        # grads = grad(lambda p: jax_loss_wrapper(p, batch_arrays, loss_type=loss_type, n_trajs=n_trajs, debug=False))(params)
         
         # Apply optimizer update
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
