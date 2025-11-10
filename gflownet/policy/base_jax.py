@@ -14,7 +14,7 @@ class ModelBaseJAX(ABC):
         self.dtype: jnp.dtype = to_jnp_dtype(float_precision)
 
         # Env-provided dims / fixed distributions
-        self.state_dim: int = int(env.policy_input_dim)
+        self.state_dim: int = config.get("state_dim", int(env.policy_input_dim))
         self.fixed_output = jnp.asarray(env.fixed_policy_output, dtype=self.dtype)
         self.random_output = jnp.asarray(env.random_policy_output, dtype=self.dtype)
         self.output_dim: int = int(self.fixed_output.shape[0])
@@ -37,7 +37,8 @@ class ModelBaseJAX(ABC):
         elif self.shared_weights and self.base is not None:
             self.type = self.base.type
         else:
-            raise ValueError("Policy type must be defined if shared_weights is False.")
+            # Default to mlp for backward policies with shared_weights but no base
+            self.type = "mlp"
 
     @abstractmethod
     def instantiate(self, key: jax.Array):
@@ -62,6 +63,10 @@ class ModelBaseJAX(ABC):
         If shared_weights=True and base is present, reuse base trunk (all but last Linear)
         and create a fresh last Linear with matching shapes.
         """
+        # If shared_weights but no base, disable sharing
+        if self.shared_weights and self.base is None:
+            self.shared_weights = False
+        
         if self.shared_weights:
             if self.base is None or not isinstance(self.base.model, eqx.nn.Sequential):
                 raise ValueError(
@@ -103,11 +108,15 @@ class ModelBaseJAX(ABC):
 
 # ---- Policy -----------------------------------------------------------------
 class PolicyJAX(ModelBaseJAX):
-    def __init__(self, config, env, device, float_precision, base=None, key: Optional[jax.Array] = None):
+    def __init__(self, env, device, float_precision, base=None, key: Optional[jax.Array] = None, instantiate_now: bool = True, **config):
+        # Convert dict config to OmegaConf for consistency with PyTorch
+        config = OmegaConf.create(config)
         super().__init__(config, env, device, float_precision, base)
-        if key is None:
-            key = jax.random.PRNGKey(0)
-        self.instantiate(key)
+        instantiate_now = config.get("instantiate_now", True)
+        if instantiate_now:
+            if key is None:
+                key = jax.random.PRNGKey(0)
+            self.instantiate(key)
 
     def instantiate(self, key: jax.Array):
         if self.type == "fixed":
