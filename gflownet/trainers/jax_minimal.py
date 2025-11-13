@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import jit, value_and_grad, grad
+import equinox as eqx
 import optax
 from functools import partial
 from tqdm import tqdm
@@ -15,6 +16,9 @@ from gflownet.utils.common import instantiate, set_device
 from gflownet.utils.batch import Batch
 from gflownet.policy.base_jax import PolicyJAX
 from gflownet.utils.policy import parse_policy_config
+
+import torch
+
 
 
 # ============================================================================
@@ -26,7 +30,6 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
     Extract JAX-compatible arrays from PyTorch Batch.
     This is the bridge between PyTorch sampling and JAX training.
     """
-    import torch
     
     # Get trajectory indices (consecutive numbering for grouping)
     traj_indices = pytorch_batch.get_trajectory_indices(consecutive=True)
@@ -83,8 +86,7 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
 
 
 def convert_params_to_jax(agent, config, key):
-    # Map PyTorch dtype to integer precision for JAX
-    import torch
+
     if isinstance(agent.float, torch.dtype):
         if agent.float == torch.float16:
             float_precision = 16
@@ -149,9 +151,8 @@ def convert_params_to_jax(agent, config, key):
         
         # Change target to use JAX policy
         backward_config["_target_"] = "gflownet.policy.base_jax.PolicyJAX"
-        # Add key for JAX initialization
         backward_config["key"] = None
-        # Don't override state_dim - let it be determined from env.policy_input_dim
+        
         # Don't instantiate yet
         backward_config["instantiate_now"] = False
         
@@ -160,7 +161,6 @@ def convert_params_to_jax(agent, config, key):
             env=agent.env,
             device=agent.device,
             float_precision=float_precision,
-            # base=None  # Don't pass base to avoid config issues
         )
         
         # Set base after instantiation
@@ -195,53 +195,11 @@ def convert_params_to_jax(agent, config, key):
 
     return jax_params, jax_policies
 
-
-import equinox as eqx
-
-class MLP(eqx.Module):
-    layers: list
-
-    def __init__(self, in_dim, hidden_dim, out_dim):
-        self.layers = [
-            eqx.nn.Linear(in_dim, hidden_dim, key=jax.random.PRNGKey(0)),
-            eqx.nn.Linear(hidden_dim, out_dim, key=jax.random.PRNGKey(1))
-        ]
-
-    def __call__(self, x):
-        x = self.layers[0](x)
-        x = jax.nn.relu(x)
-        x = self.layers[1](x)
-        return x
-
-def jax_mlp_forward(params, x):
-    """
-    JAX implementation using Equinox Linear layers.
-    """
-    
-    dummy_key = jax.random.PRNGKey(0)
-
-    # Create Linear layers from params
-    linear1 = eqx.nn.Linear(params['0.weight'].shape[1], params['0.weight'].shape[0], key=dummy_key)
-    linear1 = eqx.tree_at(lambda m: m.weight, linear1, params['0.weight'])
-    linear1 = eqx.tree_at(lambda m: m.bias, linear1, params['0.bias'])
-
-    linear2 = eqx.nn.Linear(params['2.weight'].shape[1], params['2.weight'].shape[0], key=dummy_key)
-    linear2 = eqx.tree_at(lambda m: m.weight, linear2, params['2.weight'])
-    linear2 = eqx.tree_at(lambda m: m.bias, linear2, params['2.bias'])
-    
-    x = linear1(x)
-    x = jax.nn.relu(x)
-    x = linear2(x)
-    return x
-
-
 def apply_params_to_pytorch(jax_params, agent, jax_policies):
     """
     Copy JAX parameters back to PyTorch models.
     This allows us to continue using PyTorch models for sampling.
     """
-    import torch
-    import numpy as np
     
     try:
         # Update forward policy
@@ -403,7 +361,7 @@ def train(agent, config):
             return jnp.mean((batch_arrays['logprobs'] - batch_arrays['logprobs_rev']) ** 2)
     
     # Define JAX grad step
-    @partial(jit, static_argnames=['loss_type', 'n_trajs'])
+    @partial(jit, static_argnames=['optimizer','loss_type', 'n_trajs'])
     def jax_grad_step(params, opt_state, batch_arrays, optimizer, loss_type=loss_type, n_trajs=None):
         """
         JIT-compiled gradient step.
@@ -423,8 +381,7 @@ def train(agent, config):
         
         return new_params, new_opt_state, loss_value, grads
     
-    # Training loop (mostly identical to original)
-    total_iterations = agent.n_train_steps - agent.it + 1  # Exact number of iterations
+    total_iterations = agent.n_train_steps - agent.it + 1
     pbar = tqdm(
         initial=agent.it - 1,
         total=total_iterations,
@@ -432,8 +389,6 @@ def train(agent, config):
     )
     
     for iteration in range(agent.it, agent.n_train_steps + 1):
-        # ========== PYTORCH: Sampling ==========
-        # Sample batch using PyTorch (unchanged)
         
         batch = Batch(
             env=agent.env,
@@ -442,6 +397,7 @@ def train(agent, config):
             float_type=agent.float,
         )
         
+        # Sample batch (PyTorch)
         for _ in range(agent.sttr):
             sub_batch, _ = agent.sample_batch(
                 n_forward=agent.batch_size.forward,
@@ -453,7 +409,7 @@ def train(agent, config):
         # Convert batch to JAX arrays
         batch_arrays = convert_batch_to_jax_arrays(batch)
         
-        n_trajs = batch_arrays.pop('n_trajs')  # Extract and remove from dict
+        n_trajs = batch_arrays.pop('n_trajs') 
         
         # ========== JAX: Training Steps ==========
         # Perform multiple gradient steps (train-to-sample ratio)
