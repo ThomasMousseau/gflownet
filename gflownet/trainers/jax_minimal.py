@@ -426,7 +426,7 @@ def train(agent, config):
         # Sync JAX params back to PyTorch (for next sampling iteration)
         apply_params_to_pytorch(jax_params, agent, jax_policies)
         
-                # Debug: Print parameters for first 5 iterations
+        # Debug: Print parameters for first 5 iterations
         if iteration <= 5:
             print(f"JAX Iteration {iteration}: logZ sum = {jnp.sum(jax_params['logZ']):.4f}")
             if 'forward_policy_trainable' in jax_params and jax_params['forward_policy_trainable'] is not None:
