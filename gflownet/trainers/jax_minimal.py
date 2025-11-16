@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import jit, value_and_grad, grad
 import equinox as eqx
+import torch.nn as nn
 import optax
 from functools import partial
 from tqdm import tqdm
@@ -87,6 +88,7 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
 
 def convert_params_to_jax(agent, config, key):
 
+    # ----- float precision -----
     if isinstance(agent.float, torch.dtype):
         if agent.float == torch.float16:
             float_precision = 16
@@ -95,140 +97,233 @@ def convert_params_to_jax(agent, config, key):
         elif agent.float == torch.float64:
             float_precision = 64
         else:
-            float_precision = 32  # Default fallback
+            float_precision = 32
     else:
-        float_precision = agent.float  # Assume it's already an int
-    
+        float_precision = agent.float
+
     jax_params = {}
     jax_policies = {}
-    
-    # Parse forward policy config like in common.py
+
+    # ------------------------------------------------------------------
+    # FORWARD POLICY
+    # ------------------------------------------------------------------
     forward_config = parse_policy_config(config, kind="forward")
     forward_config = forward_config["config"]
     if forward_config is not None:
-        # Change target to use JAX policy
         forward_config["_target_"] = "gflownet.policy.base_jax.PolicyJAX"
-        # Add key for JAX initialization
-        forward_config["key"] = None
-        # Don't override state_dim - let it be determined from env.policy_input_dim
-        
+        forward_config["key"] = None  # will be set internally
+
         jax_policy_f = instantiate(
             forward_config,
             env=agent.env,
             device=agent.device,
             float_precision=float_precision,
         )
-        
-        jax_policies['forward'] = jax_policy_f
-        
-        # Sync parameters from PyTorch model
-        if agent.forward_policy.is_model:
-            pt_params = dict(agent.forward_policy.model.named_parameters())
-            # Assuming MLP with 2 Linear layers
-            jax_policy_f.model = eqx.tree_at(lambda m: m.layers[0].weight, jax_policy_f.model, jnp.array(pt_params['0.weight'].detach().cpu().numpy()))
-            jax_policy_f.model = eqx.tree_at(lambda m: m.layers[0].bias, jax_policy_f.model, jnp.array(pt_params['0.bias'].detach().cpu().numpy()))
-            jax_policy_f.model = eqx.tree_at(lambda m: m.layers[2].weight, jax_policy_f.model, jnp.array(pt_params['2.weight'].detach().cpu().numpy()))
-            jax_policy_f.model = eqx.tree_at(lambda m: m.layers[2].bias, jax_policy_f.model, jnp.array(pt_params['2.bias'].detach().cpu().numpy()))
-            
-            # Partition into trainable and static for optax
-            trainable, static = eqx.partition(jax_policy_f.model, eqx.is_array)
-            jax_params['forward_policy_trainable'] = trainable
-            jax_policies['forward_static'] = static
-        else:
-            jax_params['forward_policy_trainable'] = None
-            jax_policies['forward_static'] = None
+        jax_policies["forward"] = jax_policy_f
 
-    # Parse backward policy config
+        if agent.forward_policy.is_model:
+            pt_model_f = agent.forward_policy.model          # nn.Sequential
+            jax_model_f = jax_policy_f.model                # Equinox Sequential
+
+            # Sync 3 Linear layers: PT[0,2,4] <-> JAX.layers[0,2,4]
+            jax_model_f = eqx.tree_at(
+                lambda m: m.layers[0].weight,
+                jax_model_f,
+                jnp.array(pt_model_f[0].weight.detach().cpu().numpy()),
+            )
+            jax_model_f = eqx.tree_at(
+                lambda m: m.layers[0].bias,
+                jax_model_f,
+                jnp.array(pt_model_f[0].bias.detach().cpu().numpy()),
+            )
+
+            jax_model_f = eqx.tree_at(
+                lambda m: m.layers[2].weight,
+                jax_model_f,
+                jnp.array(pt_model_f[2].weight.detach().cpu().numpy()),
+            )
+            jax_model_f = eqx.tree_at(
+                lambda m: m.layers[2].bias,
+                jax_model_f,
+                jnp.array(pt_model_f[2].bias.detach().cpu().numpy()),
+            )
+
+            jax_model_f = eqx.tree_at(
+                lambda m: m.layers[4].weight,
+                jax_model_f,
+                jnp.array(pt_model_f[4].weight.detach().cpu().numpy()),
+            )
+            jax_model_f = eqx.tree_at(
+                lambda m: m.layers[4].bias,
+                jax_model_f,
+                jnp.array(pt_model_f[4].bias.detach().cpu().numpy()),
+            )
+
+            jax_policy_f.model = jax_model_f
+
+            # Partition into trainable/static
+            trainable_f, static_f = eqx.partition(jax_model_f, eqx.is_array)
+            jax_params["forward_policy_trainable"] = trainable_f
+            jax_policies["forward_static"] = static_f
+        else:
+            jax_params["forward_policy_trainable"] = None
+            jax_policies["forward_static"] = None
+
+    # ------------------------------------------------------------------
+    # BACKWARD POLICY
+    # ------------------------------------------------------------------
     backward_config = parse_policy_config(config, kind="backward")
     backward_config = backward_config["config"]
     if backward_config is not None:
-        # If shared_weights but no base, copy n_hid and n_layers from forward
+        # copy n_hid / n_layers if shared_weights
         if backward_config.get("shared_weights", False) and forward_config is not None:
-            if "n_hid" not in backward_config and "n_hid" in forward_config:
+            if "n_hid" in forward_config and "n_hid" not in backward_config:
                 backward_config["n_hid"] = forward_config["n_hid"]
-            if "n_layers" not in backward_config and "n_layers" in forward_config:
+            if "n_layers" in forward_config and "n_layers" not in backward_config:
                 backward_config["n_layers"] = forward_config["n_layers"]
-        
-        # Change target to use JAX policy
+
         backward_config["_target_"] = "gflownet.policy.base_jax.PolicyJAX"
         backward_config["key"] = None
-        
-        # Don't instantiate yet
         backward_config["instantiate_now"] = False
-        
+
         jax_policy_b = instantiate(
             backward_config,
             env=agent.env,
             device=agent.device,
             float_precision=float_precision,
         )
-        
-        # Set base after instantiation
-        jax_policy_b.base = jax_policies['forward']
-        
-        # Now instantiate the model
-        jax_policy_b.instantiate(jax.random.PRNGKey(0))
-        
-        jax_policies['backward'] = jax_policy_b
-        
-        # Sync parameters from PyTorch model
-        if agent.backward_policy.is_model:
-            pt_params = dict(agent.backward_policy.model.named_parameters())
-            jax_policy_b.model = eqx.tree_at(lambda m: m.layers[0].weight, jax_policy_b.model, jnp.array(pt_params['0.0.weight'].detach().cpu().numpy()))
-            jax_policy_b.model = eqx.tree_at(lambda m: m.layers[0].bias, jax_policy_b.model, jnp.array(pt_params['0.0.bias'].detach().cpu().numpy()))
-            jax_policy_b.model = eqx.tree_at(lambda m: m.layers[2].weight, jax_policy_b.model, jnp.array(pt_params['0.2.weight'].detach().cpu().numpy()))
-            jax_policy_b.model = eqx.tree_at(lambda m: m.layers[2].bias, jax_policy_b.model, jnp.array(pt_params['0.2.bias'].detach().cpu().numpy()))
-            
-            # Partition into trainable and static for optax
-            trainable, static = eqx.partition(jax_policy_b.model, eqx.is_array)
-            jax_params['backward_policy_trainable'] = trainable
-            jax_policies['backward_static'] = static
-        else:
-            jax_params['backward_policy_trainable'] = None
-            jax_policies['backward_static'] = None
 
-    # Handle logZ
+        # if PolicyJAX uses base for shared weights, keep this:
+        jax_policy_b.base = jax_policies.get("forward", None)
+        jax_policy_b.instantiate(jax.random.PRNGKey(0))
+
+        jax_policies["backward"] = jax_policy_b
+
+        if agent.backward_policy.is_model:
+            pt_model_b = agent.backward_policy.model        # now flat nn.Sequential
+            jax_model_b = jax_policy_b.model                # Equinox Sequential
+
+            # Same mapping: PT[0,2,4] <-> JAX.layers[0,2,4]
+            jax_model_b = eqx.tree_at(
+                lambda m: m.layers[0].weight,
+                jax_model_b,
+                jnp.array(pt_model_b[0].weight.detach().cpu().numpy()),
+            )
+            jax_model_b = eqx.tree_at(
+                lambda m: m.layers[0].bias,
+                jax_model_b,
+                jnp.array(pt_model_b[0].bias.detach().cpu().numpy()),
+            )
+
+            jax_model_b = eqx.tree_at(
+                lambda m: m.layers[2].weight,
+                jax_model_b,
+                jnp.array(pt_model_b[2].weight.detach().cpu().numpy()),
+            )
+            jax_model_b = eqx.tree_at(
+                lambda m: m.layers[2].bias,
+                jax_model_b,
+                jnp.array(pt_model_b[2].bias.detach().cpu().numpy()),
+            )
+
+            jax_model_b = eqx.tree_at(
+                lambda m: m.layers[4].weight,
+                jax_model_b,
+                jnp.array(pt_model_b[4].weight.detach().cpu().numpy()),
+            )
+            jax_model_b = eqx.tree_at(
+                lambda m: m.layers[4].bias,
+                jax_model_b,
+                jnp.array(pt_model_b[4].bias.detach().cpu().numpy()),
+            )
+
+            jax_policy_b.model = jax_model_b
+
+            trainable_b, static_b = eqx.partition(jax_model_b, eqx.is_array)
+            jax_params["backward_policy_trainable"] = trainable_b
+            jax_policies["backward_static"] = static_b
+        else:
+            jax_params["backward_policy_trainable"] = None
+            jax_policies["backward_static"] = None
+
+    # ------------------------------------------------------------------
+    # logZ
+    # ------------------------------------------------------------------
     if agent.logZ is not None:
-        jax_params['logZ'] = jnp.array(agent.logZ.detach().cpu().numpy())
+        jax_params["logZ"] = jnp.array(agent.logZ.detach().cpu().numpy())
     else:
-        jax_params['logZ'] = None
+        jax_params["logZ"] = None
 
     return jax_params, jax_policies
 
 def apply_params_to_pytorch(jax_params, agent, jax_policies):
     """
     Copy JAX parameters back to PyTorch models.
-    This allows us to continue using PyTorch models for sampling.
+    Assumes forward and backward policies both have a flat MLP:
+    [Linear, Act, Linear, Act, Linear].
     """
-    
     try:
-        # Update forward policy
-        if 'forward_policy_trainable' in jax_params and jax_params['forward_policy_trainable'] is not None:
-            jax_model = eqx.combine(jax_params['forward_policy_trainable'], jax_policies['forward_static'])
-            pt_model = agent.forward_policy.model
-            pt_model[0].weight.data = torch.tensor(jax_model.layers[0].weight).to(pt_model[0].weight.device)
-            pt_model[0].bias.data = torch.tensor(jax_model.layers[0].bias).to(pt_model[0].bias.device)
-            pt_model[2].weight.data = torch.tensor(jax_model.layers[2].weight).to(pt_model[2].weight.device)
-            pt_model[2].bias.data = torch.tensor(jax_model.layers[2].bias).to(pt_model[2].bias.device)
+        # ---------- FORWARD POLICY ----------
+        if (
+            "forward_policy_trainable" in jax_params
+            and jax_params["forward_policy_trainable"] is not None
+        ):
+            jax_model_f = eqx.combine(
+                jax_params["forward_policy_trainable"],
+                jax_policies["forward_static"],
+            )
+            pt_model_f = agent.forward_policy.model  # nn.Sequential
 
-        # Update backward policy
-        if 'backward_policy_trainable' in jax_params and jax_params['backward_policy_trainable'] is not None:
-            jax_model = eqx.combine(jax_params['backward_policy_trainable'], jax_policies['backward_static'])
-            pt_model = agent.backward_policy.model
-            pt_model[0].weight.data = torch.tensor(jax_model.layers[0].weight).to(pt_model[0].weight.device)
-            pt_model[0].bias.data = torch.tensor(jax_model.layers[0].bias).to(pt_model[0].bias.device)
-            pt_model[2].weight.data = torch.tensor(jax_model.layers[2].weight).to(pt_model[2].weight.device)
-            pt_model[2].bias.data = torch.tensor(jax_model.layers[2].bias).to(pt_model[2].bias.device)
-        
-        # Update logZ
-        if jax_params['logZ'] is not None and agent.logZ is not None:
-            agent.logZ.data = torch.from_numpy(
-                np.array(jax_params['logZ'])
-            ).to(agent.logZ.device, agent.logZ.dtype)
+            forward_pairs = [
+                (pt_model_f[0], jax_model_f.layers[0]),
+                (pt_model_f[2], jax_model_f.layers[2]),
+                (pt_model_f[4], jax_model_f.layers[4]),
+            ]
+
+            for pt_lin, jax_lin in forward_pairs:
+                w_np = np.asarray(jax_lin.weight, dtype=np.float32)
+                w_t = torch.from_numpy(w_np).to(pt_lin.weight.device, pt_lin.weight.dtype)
+                pt_lin.weight.data.copy_(w_t)
+
+                b_np = np.asarray(jax_lin.bias, dtype=np.float32)
+                b_t = torch.from_numpy(b_np).to(pt_lin.bias.device, pt_lin.bias.dtype)
+                pt_lin.bias.data.copy_(b_t)
+
+        # ---------- BACKWARD POLICY ----------
+        if (
+            "backward_policy_trainable" in jax_params
+            and jax_params["backward_policy_trainable"] is not None
+        ):
+            jax_model_b = eqx.combine(
+                jax_params["backward_policy_trainable"],
+                jax_policies["backward_static"],
+            )
+            pt_model_b = agent.backward_policy.model  # nn.Sequential (flat now!)
+
+            backward_pairs = [
+                (pt_model_b[0], jax_model_b.layers[0]),
+                (pt_model_b[2], jax_model_b.layers[2]),
+                (pt_model_b[4], jax_model_b.layers[4]),
+            ]
+
+            for pt_lin, jax_lin in backward_pairs:
+                w_np = np.asarray(jax_lin.weight, dtype=np.float32)
+                w_t = torch.from_numpy(w_np).to(pt_lin.weight.device, pt_lin.weight.dtype)
+                pt_lin.weight.data.copy_(w_t)
+
+                b_np = np.asarray(jax_lin.bias, dtype=np.float32)
+                b_t = torch.from_numpy(b_np).to(pt_lin.bias.device, pt_lin.bias.dtype)
+                pt_lin.bias.data.copy_(b_t)
+
+        # ---------- logZ ----------
+        if jax_params.get("logZ", None) is not None and agent.logZ is not None:
+            logZ_np = np.asarray(jax_params["logZ"])
+            logZ_t = torch.from_numpy(logZ_np).to(agent.logZ.device, agent.logZ.dtype)
+            agent.logZ.data.copy_(logZ_t)
+
     except Exception as e:
         print(f"Warning: Failed to sync JAX parameters back to PyTorch: {e}")
         print("Continuing with JAX-only training (parameters won't be synced back)")
-
 
 def train(agent, config):
     """
@@ -342,15 +437,15 @@ def train(agent, config):
                 traj_loss = (logZ + log_pF - log_pB - log_R) ** 2
                 
                 # Debug print for first trajectory (will print every iteration)
-                # if traj_idx == 0 and debug:
-                #     print(f"JAX Debug traj 0: log_pF={log_pF:.4f}, log_pB={log_pB:.4f}, log_R={log_R:.4f}, logZ={logZ:.4f}, reward={batch_arrays['terminating_rewards'][traj_idx]:.4f}")
-                #     print(f"JAX Debug loss components: logZ + log_pF - log_pB - log_R = {logZ + log_pF - log_pB - log_R:.4f}, squared = {traj_loss:.4f}")
+                #if traj_idx == 0 and debug:
+                    #print(f"JAX Debug traj 0: log_pF={log_pF:.4f}, log_pB={log_pB:.4f}, log_R={log_R:.4f}, logZ={logZ:.4f}, reward={batch_arrays['terminating_rewards'][traj_idx]:.4f}")
+                    #print(f"JAX Debug loss components: logZ + log_pF - log_pB - log_R = {logZ + log_pF - log_pB - log_R:.4f}, squared = {traj_loss:.4f}")
                 
                 return traj_loss
             
             # Compute loss for all trajectories
             losses = jax.vmap(compute_traj_loss)(traj_indices)
-            #!losses = jnp.array([compute_traj_loss(tidx) for tidx in traj_indices])
+            #losses = jnp.array([compute_traj_loss(tidx) for tidx in traj_indices])
             
             
             # Mean loss
@@ -429,12 +524,6 @@ def train(agent, config):
         # Debug: Print parameters for first 5 iterations
         if iteration <= 5:
             print(f"JAX Iteration {iteration}: logZ sum = {jnp.sum(jax_params['logZ']):.4f}")
-            if 'forward_policy_trainable' in jax_params and jax_params['forward_policy_trainable'] is not None:
-                jax_model = eqx.combine(jax_params['forward_policy_trainable'], jax_policies['forward_static'])
-                print(f"JAX forward_policy weight[0,0]: {jax_model.layers[0].weight[0,0]:.4f}")
-            if 'backward_policy_trainable' in jax_params and jax_params['backward_policy_trainable'] is not None:
-                jax_model = eqx.combine(jax_params['backward_policy_trainable'], jax_policies['backward_static'])
-                print(f"JAX backward_policy weight[0,0]: {jax_model.layers[0].weight[0,0]:.4f}")
         
         # ========== LOGGING & SIDE EFFECTS (unchanged) ==========
         # Update loss EMA

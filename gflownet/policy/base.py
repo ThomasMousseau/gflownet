@@ -59,15 +59,11 @@ class ModelBase(ABC):
             Activation function
         """
         if self.shared_weights == True and self.base is not None:
-            mlp = nn.Sequential(
-                self.base.model[:-1],
-                nn.Linear(
+            return self.base.model[:-1].append(nn.Linear(
                     self.base.model[-1].in_features,
                     self.base.model[-1].out_features,
                     dtype=self.float,
-                ),
-            )
-            return mlp
+                ))
         elif self.shared_weights == False:
             layers_dim = (
                 [self.state_dim] + [self.n_hid] * self.n_layers + [self.output_dim]

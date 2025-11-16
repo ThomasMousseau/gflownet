@@ -983,9 +983,6 @@ class GFlowNetAgent:
             # Debug: Print parameters for first 5 iterations
             if self.it <= 5:
                 print(f"PyTorch Iteration {self.it}: logZ sum = {self.logZ.sum().item():.4f}")
-                if hasattr(self.forward_policy, 'model'):
-                    first_param = next(self.forward_policy.model.parameters())
-                    print(f"PyTorch {first_param.shape}: {first_param.data.flatten()[:3]}")
 
             # Debug: Loss components for iteration 1
             if self.it == 1:
