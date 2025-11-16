@@ -33,7 +33,7 @@ class Batch:
     to the source state, but the latter is not stored in the batch for each trajectory.
     This implies that one has to be careful when indexing the list of batch_indices in
     self.trajectories by using self.state_indices. For example, the batch index of
-    state state_idx of trajectory traj_idx is self.trajectories[traj_idx][state_idx-1]
+    state state_idx of trajectory traj_idx is self.trajectories[traj_idx][state_idx-1x]
     (not self.trajectories[traj_idx][state_idx]).
     """
 

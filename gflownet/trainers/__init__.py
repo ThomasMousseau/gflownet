@@ -1,6 +1,7 @@
 from typing import Any, Callable, Dict, TYPE_CHECKING
 
 from . import jax as jax_trainer
+from . import jax_minimal as jax_minimal_trainer
 from . import legacy as legacy_trainer
 from . import pure as pure_trainer
 
@@ -12,7 +13,8 @@ TrainerFn = Callable[["GFlowNetAgent", Any], Any]
 _TRAINERS: Dict[str, TrainerFn] = {
     "legacy": legacy_trainer.train,
     "pure": pure_trainer.train,
-    "jax": jax_trainer.train,
+    "jax": jax_minimal_trainer.train,  # Use minimal JAX trainer
+    "jax_full": jax_trainer.train,  # Keep full version for later
 }
 
 

@@ -30,4 +30,8 @@ def parse_policy_config(config: DictConfig, kind: str) -> Optional[DictConfig]:
     del policy_config.backward
     del policy_config.shared
 
+    # ALWAYS use PyTorch Policy for Phase 1 JAX (minimal integration)
+    # JAX policies will be used in Phase 2
+    policy_config["_target_"] = "gflownet.policy.base.Policy"
+
     return policy_config

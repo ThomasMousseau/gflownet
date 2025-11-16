@@ -980,6 +980,21 @@ class GFlowNetAgent:
             # models
             times = self.log_train_iteration(pbar, losses, batch, times)
 
+            # Debug: Print parameters for first 5 iterations
+            if self.it <= 5:
+                print(f"PyTorch Iteration {self.it}: logZ sum = {self.logZ.sum().item():.4f}")
+                if hasattr(self.forward_policy, 'model'):
+                    first_param = next(self.forward_policy.model.parameters())
+                    print(f"PyTorch {first_param.shape}: {first_param.data.flatten()[:3]}")
+
+            # Debug: Loss components for iteration 1
+            if self.it == 1:
+                from gflownet.utils.batch import compute_logprobs_trajectories
+                logprobs_f = compute_logprobs_trajectories(batch, forward_policy=self.forward_policy, backward=False)
+                logprobs_b = compute_logprobs_trajectories(batch, backward_policy=self.backward_policy, backward=True)
+                logrewards = batch.get_terminating_rewards(log=True, sort_by="trajectory")
+                print(f"PyTorch Traj 0: log_pF={logprobs_f[0]:.4f}, log_pB={logprobs_b[0]:.4f}, log_R={logrewards[0]:.4f}, logZ={self.logZ.sum():.4f}")
+
             # Log times
             t1_iter = time.time()
             times.update({"iter": t1_iter - t0_iter})

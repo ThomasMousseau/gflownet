@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import hydra
+from jax import config
 import pandas as pd
 from omegaconf import open_dict
 
@@ -32,10 +33,8 @@ def main(config):
     # Set other random seeds
     set_seeds(config.seed)
 
-    # Initialize a GFlowNet agent from the configuration file
+    #! Initialize a GFlowNet agent from the configuration file
     gflownet = gflownet_from_config(config)
-
-    #! gflownet.train()
     trainer = get_trainer(config.trainer.mode)
     trainer(gflownet, config)
 
