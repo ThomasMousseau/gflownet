@@ -422,6 +422,10 @@ def train(agent, config):
                 logprobs_b_all = jax.nn.log_softmax(logits_b, axis=1)
                 logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
                 log_pB = jnp.sum(logprobs_b * mask)
+
+                #Investigate impact of backward policy
+                #log_pB = 0.0  # Placeholder for backward logprob 
+                log_pB = jnp.sum(batch_arrays['logprobs_rev'] * mask)
                 
                 # Get terminal reward (from terminating_rewards array)
                 log_R = jnp.log(batch_arrays['terminating_rewards'][traj_idx] + 1e-8)  # Safe log
