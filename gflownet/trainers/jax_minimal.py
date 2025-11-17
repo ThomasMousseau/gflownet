@@ -338,6 +338,10 @@ def train(agent, config):
     2. Only convert gradient computation to JAX
     3. Sync parameters between PyTorch and JAX each iteration
     """
+    #! TEMPORARY TESTING SETTING
+    # print(f"JAX: sttr={agent.sttr}, ttsr={agent.ttsr}, batch_size.forward={agent.batch_size.forward}, train_to_sample_ratio={config.gflownet.optimizer.train_to_sample_ratio}")
+    # agent.sttr = 3
+    
     
     # Setup Optax optimizer with separate LR for logZ
     lr_schedule_main = optax.piecewise_constant_schedule(
@@ -378,8 +382,7 @@ def train(agent, config):
         }
     )
     
-    # Initialize JAX parameters from PyTorch agent
-    key = jax.random.PRNGKey(42)
+    key = jax.random.PRNGKey(config.seed)
     jax_params, jax_policies = convert_params_to_jax(agent, config, key)
     
     # Check if we have any trainable parameters
@@ -395,93 +398,9 @@ def train(agent, config):
         print("  - Backward policy is not a neural network model")
         print("  - LogZ is None")
         print("  Training will proceed but parameters won't be updated.")
-        # Create a dummy parameter to avoid empty pytree issues
-        jax_params['_dummy'] = jnp.array([0.0])
     
     opt_state = optimizer.init(jax_params)
-    
-    # Determine loss type from config
     loss_type = config.loss.get('_target_', 'trajectorybalance').split('.')[-1].lower()
-    
-    # !Define JAX loss wrapper with access to jax_policies
-    # @partial(jit, static_argnames=['loss_type', 'n_trajs', 'debug'])
-    # def jax_loss_wrapper(params, batch_arrays, loss_type=loss_type, n_trajs=None, debug=False):
-    #     """
-    #     JAX-compatible loss computation.
-        
-    #     Phase 1: Simple wrapper that computes a basic loss from batch data.
-    #     This is a placeholder - you'll need to implement the actual loss logic.
-        
-    #     For trajectory balance: loss = (log_pF - log_pB + log_R - logZ)^2
-    #     """
-        
-    #     if loss_type == 'trajectorybalance':
-            
-    #         # Use the passed n_trajs (static)
-    #         traj_indices = jnp.arange(n_trajs)
-            
-    #         # Compute per-trajectory losses
-    #         def compute_traj_loss(traj_idx):
-    #             # Get indices for this trajectory
-    #             mask = (batch_arrays['trajectory_indices'] == traj_idx).astype(jnp.float32)
-                
-    #             # Combine trainable and static parts for forward policy
-    #             if 'forward_policy_trainable' in params and params['forward_policy_trainable'] is not None:
-    #                 model_f = eqx.combine(params['forward_policy_trainable'], jax_policies['forward_static'])
-    #             else:
-    #                 model_f = jax_policies['forward'].model
-                
-    #             # Compute logprobs using JAX forward
-    #             # Use vmap to vectorize the model over the batch dimension
-    #             # Equinox models expect single inputs (features,), so we vmap over batch
-    #             logits_f = jax.vmap(model_f)(batch_arrays['states_policy'])
-    #             logprobs_f_all = jax.nn.log_softmax(logits_f, axis=1)
-    #             logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
-    #             log_pF = jnp.sum(logprobs_f * mask)
-                
-    #             # Combine trainable and static parts for backward policy
-    #             if 'backward_policy_trainable' in params and params['backward_policy_trainable'] is not None:
-    #                 model_b = eqx.combine(params['backward_policy_trainable'], jax_policies['backward_static'])
-    #             else:
-    #                 model_b = jax_policies['backward'].model
-                
-    #             # Use vmap to vectorize the model over the batch dimension
-    #             logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
-    #             logprobs_b_all = jax.nn.log_softmax(logits_b, axis=1)
-    #             logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
-    #             log_pB = jnp.sum(logprobs_b * mask)
-                
-    #             # Get terminal reward (from terminating_rewards array)
-    #             log_R = jnp.log(batch_arrays['terminating_rewards'][traj_idx] + 1e-8)  # Safe log
-                
-    #             # LogZ (scalar or per-trajectory)
-    #             logZ = params.get('logZ', jnp.array(0.0))
-    #             if logZ is None:
-    #                 logZ = jnp.array(0.0)
-    #             if logZ.ndim > 0:
-    #                 logZ = jnp.sum(logZ)  # Sum the logZ vector
-                
-    #             # Trajectory balance loss: log Z + log P_F - log P_B - log R = 0
-    #             traj_loss = (logZ + log_pF - log_pB - log_R) ** 2
-                
-    #             # Debug print for first trajectory (will print every iteration)
-    #             #if traj_idx == 0 and debug:
-    #                 #print(f"JAX Debug traj 0: log_pF={log_pF:.4f}, log_pB={log_pB:.4f}, log_R={log_R:.4f}, logZ={logZ:.4f}, reward={batch_arrays['terminating_rewards'][traj_idx]:.4f}")
-    #                 #print(f"JAX Debug loss components: logZ + log_pF - log_pB - log_R = {logZ + log_pF - log_pB - log_R:.4f}, squared = {traj_loss:.4f}")
-                
-    #             return traj_loss
-            
-    #         # Compute loss for all trajectories
-    #         losses = jax.vmap(compute_traj_loss)(traj_indices)
-    #         #losses = jnp.array([compute_traj_loss(tidx) for tidx in traj_indices])
-            
-            
-    #         # Mean loss
-    #         return jnp.mean(losses)
-        
-    #     else:
-    #         # Fallback: simple MSE on logprobs
-    #         return jnp.mean((batch_arrays['logprobs'] - batch_arrays['logprobs_rev']) ** 2)
         
     @partial(jit, static_argnames=['loss_type', 'n_trajs', 'debug'])
     def jax_loss_wrapper(params, batch_arrays, loss_type=loss_type, n_trajs=None, debug=False):
@@ -579,6 +498,9 @@ def train(agent, config):
         
         # Sample batch (PyTorch)
         for _ in range(agent.sttr):
+            # if iteration % 100 == 0:
+            #     replay_len = len(agent.buffer.replay) if agent.buffer.replay is not None else 0
+            #     print(f"Iter {iteration}: backward_replay config = {agent.batch_size.backward_replay}, replay buffer len = {replay_len}")
             sub_batch, _ = agent.sample_batch(
                 n_forward=agent.batch_size.forward,
                 n_train=agent.batch_size.backward_dataset,
@@ -607,6 +529,20 @@ def train(agent, config):
         # ========== PYTORCH: Copy parameters back ==========
         # Sync JAX params back to PyTorch (for next sampling iteration)
         apply_params_to_pytorch(jax_params, agent, jax_policies)
+        
+        # ========== BUFFER UPDATE (mirroring PyTorch log_train_iteration) ==========
+        # Update the replay buffer with the current batch data
+        # states_term = batch.get_terminating_states(sort_by="trajectory")
+        # proxy_vals = batch.get_terminating_proxy_values(sort_by="trajectory")
+        # rewards = batch.get_terminating_rewards(sort_by="trajectory")
+        # actions_trajectories = batch.get_actions_trajectories()
+        
+        # # Update main buffer (if enabled)
+        # if agent.buffer.use_main_buffer:
+        #     agent.buffer.add(states_term, actions_trajectories, rewards, iteration, buffer="main")
+        
+        # # Update replay buffer
+        # agent.buffer.add(states_term, actions_trajectories, rewards, iteration, buffer="replay")
         
         # print(f"PyTorch model weight sample: {agent.forward_policy.model[0].weight.data[0,0]}")
         # print(f"JAX model weight sample: {jax_params['forward_policy_trainable']['layers']['0']['weight'][0,0]}")

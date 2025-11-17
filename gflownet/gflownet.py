@@ -931,6 +931,7 @@ class GFlowNetAgent:
 
     def train(self):
         # Train loop
+        print(f"PyTorch: sttr={self.sttr}, ttsr={self.ttsr}, batch_size.forward={self.batch_size.forward}")
         pbar = tqdm(
             initial=self.it - 1,
             total=self.n_train_steps,
@@ -959,6 +960,11 @@ class GFlowNetAgent:
                     collect_backwards_masks=self.collect_backwards_masks,
                 )
                 batch.merge(sub_batch)
+                
+            #! Debug print to see if we were sampling from replay buffer
+            # replay_len = len(self.buffer.replay) if hasattr(self.buffer, 'replay') and self.buffer.replay is not None else 0
+            # print(f"Iter {self.it}: backward_replay config = {self.batch_size.backward_replay}, replay buffer len = {replay_len}")
+    
             for j in range(self.ttsr):
                 losses = self.loss.compute(batch, get_sublosses=True)
                 # TODO: deal with this in a better way
