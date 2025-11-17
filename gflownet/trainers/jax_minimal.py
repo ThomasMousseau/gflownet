@@ -67,6 +67,9 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
     rewards_tensor = pytorch_batch.get_rewards()
     rewards = jnp.array(rewards_tensor.detach().cpu().numpy())
     
+    logrewards_tensor = pytorch_batch.get_terminating_rewards(log=True, sort_by="trajectory")
+    logrewards = jnp.array(logrewards_tensor.detach().cpu().numpy())
+    
     # Get logprobs (forward and backward)
     logprobs_fwd, _ = pytorch_batch.get_logprobs(backward=False)
     logprobs_bwd, _ = pytorch_batch.get_logprobs(backward=True)
@@ -82,7 +85,8 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
         'logprobs': logprobs,
         'logprobs_rev': logprobs_rev,
         'trajectory_indices': trajectory_indices,
-        'n_trajs': n_trajs,  # Add this
+        'n_trajs': n_trajs, 
+        'logrewards': logrewards,
     }
 
 
@@ -335,19 +339,43 @@ def train(agent, config):
     3. Sync parameters between PyTorch and JAX each iteration
     """
     
-    # Setup Optax optimizer
-    lr_schedule = optax.piecewise_constant_schedule(
+    # Setup Optax optimizer with separate LR for logZ
+    lr_schedule_main = optax.piecewise_constant_schedule(
         init_value=config.gflownet.optimizer.lr,
         boundaries_and_scales={
             i * config.gflownet.optimizer.lr_decay_period: config.gflownet.optimizer.lr_decay_gamma
             for i in range(1, config.gflownet.optimizer.n_train_steps // config.gflownet.optimizer.lr_decay_period + 1)
         }
     )
-    
-    optimizer = optax.adam(
-        learning_rate=lr_schedule,
-        b1=config.gflownet.optimizer.adam_beta1,
-        b2=config.gflownet.optimizer.adam_beta2,
+
+    lr_z_mult = getattr(config.gflownet.optimizer, 'lr_z_mult', 10) 
+    lr_schedule_logz = optax.piecewise_constant_schedule(
+        init_value=config.gflownet.optimizer.lr * lr_z_mult,
+        boundaries_and_scales={
+            i * config.gflownet.optimizer.lr_decay_period: config.gflownet.optimizer.lr_decay_gamma
+            for i in range(1, config.gflownet.optimizer.n_train_steps // config.gflownet.optimizer.lr_decay_period + 1)
+        }
+    )
+
+    optimizer = optax.multi_transform(
+        {
+            'main': optax.adam(
+                learning_rate=lr_schedule_main,
+                b1=config.gflownet.optimizer.adam_beta1,
+                b2=config.gflownet.optimizer.adam_beta2,
+            ),
+            'logz': optax.adam(
+                learning_rate=lr_schedule_logz,
+                b1=config.gflownet.optimizer.adam_beta1,
+                b2=config.gflownet.optimizer.adam_beta2,
+            ),
+        },
+        {
+            # Map parameter keys to transforms
+            'forward_policy_trainable': 'main',
+            'backward_policy_trainable': 'main',
+            'logZ': 'logz'
+        }
     )
     
     # Initialize JAX parameters from PyTorch agent
@@ -375,85 +403,133 @@ def train(agent, config):
     # Determine loss type from config
     loss_type = config.loss.get('_target_', 'trajectorybalance').split('.')[-1].lower()
     
-    # Define JAX loss wrapper with access to jax_policies
+    # !Define JAX loss wrapper with access to jax_policies
+    # @partial(jit, static_argnames=['loss_type', 'n_trajs', 'debug'])
+    # def jax_loss_wrapper(params, batch_arrays, loss_type=loss_type, n_trajs=None, debug=False):
+    #     """
+    #     JAX-compatible loss computation.
+        
+    #     Phase 1: Simple wrapper that computes a basic loss from batch data.
+    #     This is a placeholder - you'll need to implement the actual loss logic.
+        
+    #     For trajectory balance: loss = (log_pF - log_pB + log_R - logZ)^2
+    #     """
+        
+    #     if loss_type == 'trajectorybalance':
+            
+    #         # Use the passed n_trajs (static)
+    #         traj_indices = jnp.arange(n_trajs)
+            
+    #         # Compute per-trajectory losses
+    #         def compute_traj_loss(traj_idx):
+    #             # Get indices for this trajectory
+    #             mask = (batch_arrays['trajectory_indices'] == traj_idx).astype(jnp.float32)
+                
+    #             # Combine trainable and static parts for forward policy
+    #             if 'forward_policy_trainable' in params and params['forward_policy_trainable'] is not None:
+    #                 model_f = eqx.combine(params['forward_policy_trainable'], jax_policies['forward_static'])
+    #             else:
+    #                 model_f = jax_policies['forward'].model
+                
+    #             # Compute logprobs using JAX forward
+    #             # Use vmap to vectorize the model over the batch dimension
+    #             # Equinox models expect single inputs (features,), so we vmap over batch
+    #             logits_f = jax.vmap(model_f)(batch_arrays['states_policy'])
+    #             logprobs_f_all = jax.nn.log_softmax(logits_f, axis=1)
+    #             logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
+    #             log_pF = jnp.sum(logprobs_f * mask)
+                
+    #             # Combine trainable and static parts for backward policy
+    #             if 'backward_policy_trainable' in params and params['backward_policy_trainable'] is not None:
+    #                 model_b = eqx.combine(params['backward_policy_trainable'], jax_policies['backward_static'])
+    #             else:
+    #                 model_b = jax_policies['backward'].model
+                
+    #             # Use vmap to vectorize the model over the batch dimension
+    #             logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
+    #             logprobs_b_all = jax.nn.log_softmax(logits_b, axis=1)
+    #             logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
+    #             log_pB = jnp.sum(logprobs_b * mask)
+                
+    #             # Get terminal reward (from terminating_rewards array)
+    #             log_R = jnp.log(batch_arrays['terminating_rewards'][traj_idx] + 1e-8)  # Safe log
+                
+    #             # LogZ (scalar or per-trajectory)
+    #             logZ = params.get('logZ', jnp.array(0.0))
+    #             if logZ is None:
+    #                 logZ = jnp.array(0.0)
+    #             if logZ.ndim > 0:
+    #                 logZ = jnp.sum(logZ)  # Sum the logZ vector
+                
+    #             # Trajectory balance loss: log Z + log P_F - log P_B - log R = 0
+    #             traj_loss = (logZ + log_pF - log_pB - log_R) ** 2
+                
+    #             # Debug print for first trajectory (will print every iteration)
+    #             #if traj_idx == 0 and debug:
+    #                 #print(f"JAX Debug traj 0: log_pF={log_pF:.4f}, log_pB={log_pB:.4f}, log_R={log_R:.4f}, logZ={logZ:.4f}, reward={batch_arrays['terminating_rewards'][traj_idx]:.4f}")
+    #                 #print(f"JAX Debug loss components: logZ + log_pF - log_pB - log_R = {logZ + log_pF - log_pB - log_R:.4f}, squared = {traj_loss:.4f}")
+                
+    #             return traj_loss
+            
+    #         # Compute loss for all trajectories
+    #         losses = jax.vmap(compute_traj_loss)(traj_indices)
+    #         #losses = jnp.array([compute_traj_loss(tidx) for tidx in traj_indices])
+            
+            
+    #         # Mean loss
+    #         return jnp.mean(losses)
+        
+    #     else:
+    #         # Fallback: simple MSE on logprobs
+    #         return jnp.mean((batch_arrays['logprobs'] - batch_arrays['logprobs_rev']) ** 2)
+        
     @partial(jit, static_argnames=['loss_type', 'n_trajs', 'debug'])
     def jax_loss_wrapper(params, batch_arrays, loss_type=loss_type, n_trajs=None, debug=False):
-        """
-        JAX-compatible loss computation.
-        
-        Phase 1: Simple wrapper that computes a basic loss from batch data.
-        This is a placeholder - you'll need to implement the actual loss logic.
-        
-        For trajectory balance: loss = (log_pF - log_pB + log_R - logZ)^2
-        """
-        
         if loss_type == 'trajectorybalance':
+            # Reconstruct models from params
+            if 'forward_policy_trainable' in params and params['forward_policy_trainable'] is not None:
+                model_f = eqx.combine(params['forward_policy_trainable'], jax_policies['forward_static'])
+            else:
+                model_f = jax_policies['forward'].model
             
-            # Use the passed n_trajs (static)
-            traj_indices = jnp.arange(n_trajs)
+            if 'backward_policy_trainable' in params and params['backward_policy_trainable'] is not None:
+                model_b = eqx.combine(params['backward_policy_trainable'], jax_policies['backward_static'])
+            else:
+                model_b = jax_policies['backward'].model
             
-            # Compute per-trajectory losses
-            def compute_traj_loss(traj_idx):
-                # Get indices for this trajectory
-                mask = (batch_arrays['trajectory_indices'] == traj_idx).astype(jnp.float32)
-                
-                # Combine trainable and static parts for forward policy
-                if 'forward_policy_trainable' in params and params['forward_policy_trainable'] is not None:
-                    model_f = eqx.combine(params['forward_policy_trainable'], jax_policies['forward_static'])
-                else:
-                    model_f = jax_policies['forward'].model
-                
-                # Compute logprobs using JAX forward
-                # Use vmap to vectorize the model over the batch dimension
-                # Equinox models expect single inputs (features,), so we vmap over batch
-                logits_f = jax.vmap(model_f)(batch_arrays['states_policy'])
-                logprobs_f_all = jax.nn.log_softmax(logits_f, axis=1)
-                logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
+            # Compute fresh log-probs from JAX models (not pre-computed batch log-probs)
+            logits_f = jax.vmap(model_f)(batch_arrays['states_policy'])
+            logprobs_f_all = jax.nn.log_softmax(logits_f, axis=1)
+            logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
+            
+            logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
+            logprobs_b_all = jax.nn.log_softmax(logits_b, axis=1)
+            logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
+            
+            # Get logZ
+            logZ = params.get('logZ', jnp.array(0.0))
+            if logZ is not None and logZ.ndim > 0:
+                logZ = jnp.sum(logZ)
+            
+            # Compute trajectory log-prob ratios (similar to original compute_logprobs_trajectories)
+            traj_indices = batch_arrays['trajectory_indices']
+            # n_trajs = int(jnp.max(traj_indices)) + 1
+            
+            def compute_traj_logprob_ratio(traj_idx):
+                mask = (traj_indices == traj_idx).astype(jnp.float32)
                 log_pF = jnp.sum(logprobs_f * mask)
-                
-                # Combine trainable and static parts for backward policy
-                if 'backward_policy_trainable' in params and params['backward_policy_trainable'] is not None:
-                    model_b = eqx.combine(params['backward_policy_trainable'], jax_policies['backward_static'])
-                else:
-                    model_b = jax_policies['backward'].model
-                
-                # Use vmap to vectorize the model over the batch dimension
-                logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
-                logprobs_b_all = jax.nn.log_softmax(logits_b, axis=1)
-                logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
                 log_pB = jnp.sum(logprobs_b * mask)
-                
-                # Get terminal reward (from terminating_rewards array)
-                log_R = jnp.log(batch_arrays['terminating_rewards'][traj_idx] + 1e-8)  # Safe log
-                
-                # LogZ (scalar or per-trajectory)
-                logZ = params.get('logZ', jnp.array(0.0))
-                if logZ is None:
-                    logZ = jnp.array(0.0)
-                if logZ.ndim > 0:
-                    logZ = jnp.sum(logZ)  # Sum the logZ vector
-                
-                # Trajectory balance loss: log Z + log P_F - log P_B - log R = 0
-                traj_loss = (logZ + log_pF - log_pB - log_R) ** 2
-                
-                # Debug print for first trajectory (will print every iteration)
-                #if traj_idx == 0 and debug:
-                    #print(f"JAX Debug traj 0: log_pF={log_pF:.4f}, log_pB={log_pB:.4f}, log_R={log_R:.4f}, logZ={logZ:.4f}, reward={batch_arrays['terminating_rewards'][traj_idx]:.4f}")
-                    #print(f"JAX Debug loss components: logZ + log_pF - log_pB - log_R = {logZ + log_pF - log_pB - log_R:.4f}, squared = {traj_loss:.4f}")
-                
-                return traj_loss
+                return log_pF - log_pB
             
-            # Compute loss for all trajectories
-            losses = jax.vmap(compute_traj_loss)(traj_indices)
-            #losses = jnp.array([compute_traj_loss(tidx) for tidx in traj_indices])
+            #logprob_ratios = jax.vmap(compute_traj_logprob_ratio)(jnp.arange(n_trajs))
+            logprob_ratios = jnp.array([compute_traj_logprob_ratio(tidx) for tidx in jnp.arange(n_trajs)])
+            log_rewards = batch_arrays['logrewards']
             
-            
-            # Mean loss
+            losses = (logZ + logprob_ratios - log_rewards) ** 2
             return jnp.mean(losses)
         
-        else:
-            # Fallback: simple MSE on logprobs
-            return jnp.mean((batch_arrays['logprobs'] - batch_arrays['logprobs_rev']) ** 2)
+        # Fallback
+        return jnp.mean((batch_arrays['logprobs'] - batch_arrays['logprobs_rev']) ** 2)
     
     # Define JAX grad step
     @partial(jit, static_argnames=['optimizer','loss_type', 'n_trajs'])
@@ -467,12 +543,21 @@ def train(agent, config):
             params, batch_arrays, loss_type=loss_type, n_trajs=n_trajs
         )
         
+        # loss_value, grads = value_and_grad(jax_loss_wrapper)(
+        #     params, batch_arrays, loss_type=loss_type, n_trajs=n_trajs
+        # )
+        
         # loss_value = jax_loss_wrapper(params, batch_arrays, loss_type=loss_type, n_trajs=n_trajs, debug=True)
         # grads = grad(lambda p: jax_loss_wrapper(p, batch_arrays, loss_type=loss_type, n_trajs=n_trajs, debug=False))(params)
-        
+                
         # Apply optimizer update
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
+        
+        # print(f"grads logZ: {grads.get('logZ')}")
+        # print(f"updates logZ: {updates.get('logZ')}")
+        # print(f"logZ before: {params.get('logZ')}")
+        # print(f"logZ after: {new_params.get('logZ')}")
         
         return new_params, new_opt_state, loss_value, grads
     
@@ -498,6 +583,8 @@ def train(agent, config):
                 n_forward=agent.batch_size.forward,
                 n_train=agent.batch_size.backward_dataset,
                 n_replay=agent.batch_size.backward_replay,
+                collect_forwards_masks=True,
+                collect_backwards_masks=agent.collect_backwards_masks,
             )
             batch.merge(sub_batch)
         
@@ -521,10 +608,12 @@ def train(agent, config):
         # Sync JAX params back to PyTorch (for next sampling iteration)
         apply_params_to_pytorch(jax_params, agent, jax_policies)
         
-        # Debug: Print parameters for first 5 iterations
-        if iteration <= 5:
-            print(f"JAX Iteration {iteration}: logZ sum = {jnp.sum(jax_params['logZ']):.4f}")
-            print("grad logZ:", grads.get("logZ", None))
+        # print(f"PyTorch model weight sample: {agent.forward_policy.model[0].weight.data[0,0]}")
+        # print(f"JAX model weight sample: {jax_params['forward_policy_trainable']['layers']['0']['weight'][0,0]}")
+        
+        # if iteration <= 5:
+        #     print(f"JAX Iteration {iteration}: logZ sum = {jnp.sum(jax_params['logZ']):.4f}")
+        #     print("grad logZ:", grads.get("logZ", None))
         
         # ========== LOGGING & SIDE EFFECTS (unchanged) ==========
         # Update loss EMA
@@ -587,10 +676,10 @@ def train(agent, config):
             # ---------- Learning rates ----------
             # Adapt this depending on how you store LR in your JAX setup.
             # Example if you have a schedule function:
-            lr_main = float(lr_schedule(iteration))
+            lr_main = float(lr_schedule_main(iteration))
 
             # If you don't have a separate LogZ LR, just log None like the original does
-            lr_logz = None
+            lr_logz = float(lr_schedule_logz(iteration))
 
             grad_logZ = np.asarray(grads["logZ"], dtype=np.float32)
 
@@ -600,7 +689,8 @@ def train(agent, config):
                 "Trajectory lengths mean": traj_length_mean,
                 "Trajectory lengths min": traj_length_min,
                 "Trajectory lengths max": traj_length_max,
-                "Batch size": int(rewards.shape[0]),
+                "Batch size": len(batch),
+                "Batch_arrays size": batch_arrays['states'].shape[0],
                 "logZ": logz,
                 "Learning rate": lr_main,
                 "Learning rate logZ": lr_logz,

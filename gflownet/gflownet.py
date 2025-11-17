@@ -971,6 +971,7 @@ class GFlowNetAgent:
                         torch.nn.utils.clip_grad_norm_(
                             self.parameters(), self.clip_grad_norm
                         )
+                    self.grad_logz_mean = self.logZ.grad.mean().item() 
                     self.opt.step()
                     self.lr_scheduler.step()
                     self.opt.zero_grad()
@@ -1144,6 +1145,7 @@ class GFlowNetAgent:
                     "logZ": logz,
                     "Learning rate": learning_rates[0],
                     "Learning rate logZ": learning_rates[1],
+                    "grad_logZ_mean": self.grad_logz_mean 
                 },
                 step=self.it,
                 use_context=self.use_context,
