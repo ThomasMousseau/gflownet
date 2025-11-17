@@ -422,10 +422,6 @@ def train(agent, config):
                 logprobs_b_all = jax.nn.log_softmax(logits_b, axis=1)
                 logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
                 log_pB = jnp.sum(logprobs_b * mask)
-
-                #Investigate impact of backward policy
-                #log_pB = 0.0  # Placeholder for backward logprob 
-                log_pB = jnp.sum(batch_arrays['logprobs_rev'] * mask)
                 
                 # Get terminal reward (from terminating_rewards array)
                 log_R = jnp.log(batch_arrays['terminating_rewards'][traj_idx] + 1e-8)  # Safe log
@@ -528,6 +524,7 @@ def train(agent, config):
         # Debug: Print parameters for first 5 iterations
         if iteration <= 5:
             print(f"JAX Iteration {iteration}: logZ sum = {jnp.sum(jax_params['logZ']):.4f}")
+            print("grad logZ:", grads.get("logZ", None))
         
         # ========== LOGGING & SIDE EFFECTS (unchanged) ==========
         # Update loss EMA
@@ -539,20 +536,104 @@ def train(agent, config):
                 (1 - agent.loss.ema_alpha) * agent.loss.loss_ema
             )
         
-        # !Logging        
-        # if agent.evaluator.should_log_train(iteration):
-        #     agent.logger.log_train(
-        #         iteration,
-        #         {
-        #             'loss': float(loss_value),
-        #             'loss_ema': agent.loss.loss_ema,
-        #             'mean_reward': float(jnp.mean(batch_arrays['rewards'])),
-        #         }
-        #     )
-        
+        # Logging Logic
+        if agent.evaluator.should_log_train(iteration):
 
+            # ---------- Rewards & log-rewards ----------
+            rewards = jnp.asarray(batch_arrays["terminating_rewards"])
+            logrewards = jnp.log(rewards + 1e-8)
+
+            rewards_t    = torch.from_numpy(np.asarray(rewards, dtype=np.float32))
+            logrewards_t = torch.from_numpy(np.asarray(logrewards, dtype=np.float32))
+
+            # If you have proxy scores (like original `proxy_vals`), convert them too
+            proxy_vals = batch_arrays.get("terminating_scores", None)
+            if proxy_vals is not None:
+                proxy_vals_t = torch.from_numpy(np.asarray(proxy_vals, dtype=np.float32))
+            else:
+                proxy_vals_t = None
+
+            agent.logger.log_rewards_and_scores(
+                rewards=rewards_t,
+                logrewards=logrewards_t,
+                scores=proxy_vals_t,
+                step=iteration,
+                prefix="Train batch -",
+                use_context=agent.use_context,
+            )
+
+            # ---------- Trajectory lengths ----------
+            # This part assumes you have an array similar to `get_trajectory_indices()`
+            # If you don't, you can comment this block out.
+            traj_indices = batch_arrays.get("trajectory_indices", None)
+            if traj_indices is not None:
+                traj_indices = jnp.asarray(traj_indices)
+                _, counts = jnp.unique(traj_indices, return_counts=True)
+                counts = counts.astype(jnp.float32)
+
+                traj_length_mean = float(jnp.mean(counts))
+                traj_length_min  = float(jnp.min(counts))
+                traj_length_max  = float(jnp.max(counts))
+            else:
+                traj_length_mean = traj_length_min = traj_length_max = None
+
+            # ---------- logZ ----------
+            if "logZ" in jax_params:
+                # jax_params['logZ'] is a JAX array, no detach needed
+                logz = float(jnp.sum(jax_params["logZ"]))
+            else:
+                logz = None
+
+            # ---------- Learning rates ----------
+            # Adapt this depending on how you store LR in your JAX setup.
+            # Example if you have a schedule function:
+            lr_main = float(lr_schedule(iteration))
+
+            # If you don't have a separate LogZ LR, just log None like the original does
+            lr_logz = None
+
+            grad_logZ = np.asarray(grads["logZ"], dtype=np.float32)
+
+            # ---------- Scalar metrics exactly like original ----------
+            metrics = {
+                "step": iteration,
+                "Trajectory lengths mean": traj_length_mean,
+                "Trajectory lengths min": traj_length_min,
+                "Trajectory lengths max": traj_length_max,
+                "Batch size": int(rewards.shape[0]),
+                "logZ": logz,
+                "Learning rate": lr_main,
+                "Learning rate logZ": lr_logz,
+                "grad_logZ_mean": float(grad_logZ.mean()),
+            }
+
+            agent.logger.log_metrics(
+                metrics=metrics,
+                step=iteration,
+                use_context=agent.use_context,
+            )
+
+            # ---------- Loss dict mimicking original ----------
+            # Original does: losses["Loss"] = losses["all"]; logger.log_metrics(losses, ...)
+            # Here we reconstruct a similar dict.
+            losses = {
+                "all": float(loss_value),                 # same as original "all"
+                "Loss": float(loss_value),               # explicit "Loss" key
+            }
+
+            agent.logger.log_metrics(
+                metrics=losses,
+                step=iteration,
+                use_context=agent.use_context,
+            )
+            # End logging block
+        
         agent.logger.progressbar_update(
-            pbar, float(loss_value), batch_arrays['terminating_rewards'], agent.jsd, agent.use_context
+            pbar,
+            float(loss_value),
+            np.asarray(batch_arrays["terminating_rewards"], dtype=np.float32),
+            agent.jsd,
+            agent.use_context,
         )
         
         # Evaluation
