@@ -61,7 +61,7 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
         env = pytorch_batch.envs[traj_idx]
         
         if isinstance(action, tuple):
-            action_idx = env.action2index(action)
+            action_idx = env.action2index(action) # Convert (0,0) -> 2
         else:
             action_idx = action
         
@@ -383,7 +383,6 @@ def train(agent, config):
     2. Only convert gradient computation to JAX
     3. Sync parameters between PyTorch and JAX each iteration
     """
-    
     # Setup Optax optimizer with separate LR for logZ
     lr_schedule_main = optax.piecewise_constant_schedule(
         init_value=config.gflownet.optimizer.lr,
@@ -581,10 +580,6 @@ def train(agent, config):
             jax_params, opt_state, loss_value, grads = jax_grad_step(
                 jax_params, opt_state, batch_arrays, optimizer, loss_type=loss_type, n_trajs=n_trajs
             )
-            
-            # Zero out logprobs for next iteration (if needed)
-            batch_arrays['logprobs'] = jnp.zeros_like(batch_arrays['logprobs'])
-            batch_arrays['logprobs_rev'] = jnp.zeros_like(batch_arrays['logprobs_rev'])
         
         # ========== PYTORCH: Copy parameters back ==========
         # Sync JAX params back to PyTorch (for next sampling iteration)
