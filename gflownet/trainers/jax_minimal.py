@@ -49,9 +49,25 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
         states = jnp.array([s.detach().cpu().numpy() if isinstance(s, torch.Tensor) else s 
                            for s in states_policy], dtype=jnp.float32)
     
+    #! FOURNIER, le probleme etait ici
     # Get actions
-    actions_list = pytorch_batch.get_actions()
-    actions = jnp.array([a if isinstance(a, int) else a[0] for a in actions_list], dtype=jnp.int32)
+    # actions_list = pytorch_batch.get_actions()       #! [0] of a tuple is not the right logic :(
+    # actions = jnp.array([a if isinstance(a, int) else a[0] for a in actions_list], dtype=jnp.int32)
+    
+    actions = []
+    for i in range(len(pytorch_batch)):
+        action = pytorch_batch.actions[i]
+        traj_idx = pytorch_batch.traj_indices[i]
+        env = pytorch_batch.envs[traj_idx]
+        
+        if isinstance(action, tuple):
+            action_idx = env.action2index(action)
+        else:
+            action_idx = action
+        
+        actions.append(action_idx)
+    
+    actions = jnp.array(actions, dtype=jnp.int32)
     
     # Get rewards - Use terminating rewards only, as in original PyTorch
     if pytorch_batch.proxy is None:
@@ -82,18 +98,25 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
     else:
         parents_policy = jnp.array([p.detach().cpu().numpy() if isinstance(p, torch.Tensor) else p for p in parents_policy], dtype=jnp.float32)
 
-    # Add masks_forward (of parents, for forward logprobs)
-    masks_forward = pytorch_batch.get_masks_forward(of_parents=True)
-    masks_forward = jnp.array(masks_forward.detach().cpu().numpy())  # Bool, no dtype needed
-
-    # Add masks_backward (of states, for backward logprobs)
-    masks_backward = pytorch_batch.get_masks_backward()
-    masks_backward = jnp.array(masks_backward.detach().cpu().numpy())  # Bool, no dtype needed
-
-    # Debug: Check for issues
-    # print(f"parents_policy shape: {parents_policy.shape}, sample: {parents_policy[:2] if parents_policy.size > 0 else 'empty'}")
-    # print(f"masks_forward shape: {masks_forward.shape}, any True: {jnp.any(masks_forward)}")
-    # print(f"masks_backward shape: {masks_backward.shape}, any True: {jnp.any(masks_backward)}")
+    masks_forward_pt = pytorch_batch.get_masks_forward(of_parents=True)
+    masks_backward_pt = pytorch_batch.get_masks_backward()
+    
+    masks_forward = jnp.array(masks_forward_pt.detach().cpu().numpy())
+    masks_backward = jnp.array(masks_backward_pt.detach().cpu().numpy())
+    
+    # for i in range(min(5, len(pytorch_batch))):
+    #     action = pytorch_batch.actions[i]
+    #     traj_idx = pytorch_batch.traj_indices[i]
+    #     env = pytorch_batch.envs[traj_idx]
+        
+    #     if isinstance(action, tuple):
+    #         action_idx = env.action2index(action)
+    #     else:
+    #         action_idx = action
+        
+    #     mask_f = masks_forward_pt[i]
+    #     mask_b = masks_backward_pt[i]
+    #     print(f"Sample {i}: action={action}, action_idx={action_idx}, mask_f[action]={mask_f[action_idx]}, mask_b[action]={mask_b[action_idx]}")
     
     return {
         'states': states,
@@ -433,33 +456,41 @@ def train(agent, config):
                 model_b = eqx.combine(params['backward_policy_trainable'], jax_policies['backward_static'])
             else:
                 model_b = jax_policies['backward'].model
-            
-            #Compute fresh log-probs from JAX models (not pre-computed batch log-probs)
-            logits_f = jax.vmap(model_f)(batch_arrays['parents_policy'])
-            logits_f_masked = jnp.where(batch_arrays['masks_forward'], logits_f, 0.0)  #! When -inf is used, softmax gives NaN if all invalid
-            logprobs_f_all = jax.nn.log_softmax(logits_f_masked, axis=1)
-            logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
-
-            logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
-            logits_b_masked = jnp.where(batch_arrays['masks_backward'], logits_b, 0.0)  #! When -inf is used, softmax gives NaN if all invalid
-            logprobs_b_all = jax.nn.log_softmax(logits_b_masked, axis=1)
-            logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
-            
+                    
             # logits_f = jax.vmap(model_f)(batch_arrays['parents_policy'])
-            # logprobs_f_all = jax.nn.log_softmax(logits_f, axis=1)  # No masking
+            # logits_f_masked = jnp.where(batch_arrays['masks_forward'], logits_f, 0.0)  #! When -inf is used, softmax gives NaN if all invalid
+            # logprobs_f_all = jax.nn.log_softmax(logits_f_masked, axis=1)
             # logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
 
-            # # Same for backward
             # logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
-            # logprobs_b_all = jax.nn.log_softmax(logits_b, axis=1)  # No masking
+            # logits_b_masked = jnp.where(batch_arrays['masks_backward'], logits_b, 0.0)  #! When -inf is used, softmax gives NaN if all invalid
+            # logprobs_b_all = jax.nn.log_softmax(logits_b_masked, axis=1)
             # logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
             
-            # Debug: Check for NaN in logits
-            # if debug:
-            #     jax.debug.print("logits_f has NaN: {}", jnp.any(jnp.isnan(logits_f)))
-            #     jax.debug.print("logits_b has NaN: {}", jnp.any(jnp.isnan(logits_b)))
-            #     jax.debug.print("logits_f has inf: {}", jnp.any(jnp.isinf(logits_f)))
-            #     jax.debug.print("logits_b has inf: {}", jnp.any(jnp.isinf(logits_b)))
+            logits_f = jax.vmap(model_f)(batch_arrays['parents_policy'])
+            logits_f_masked = jnp.where(batch_arrays['masks_forward'], -jnp.inf, logits_f)
+            logprobs_f_all = jax.nn.log_softmax(logits_f_masked, axis=1)
+            logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
+            
+            # jax.debug.print("Sample action indices: {}", batch_arrays['actions'][:5])
+            # jax.debug.print("Sample logprobs_f_all[0]: {}", logprobs_f_all[0])
+            # jax.debug.print("Indexed logprob for sample 0: {}", logprobs_f_all[0, batch_arrays['actions'][0]])
+
+
+            logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
+            logits_b_masked = jnp.where(batch_arrays['masks_backward'], -jnp.inf, logits_b)
+            logprobs_b_all = jax.nn.log_softmax(logits_b_masked, axis=1)
+            logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
+        
+            # jax.debug.print("Sample action indices: {}", batch_arrays['actions'][:5])
+            # jax.debug.print("Sample logprobs_b_all[0]: {}", logprobs_b_all[0])
+            # jax.debug.print("Indexed logprob for sample 0: {}", logprobs_b_all[0, batch_arrays['actions'][0]])
+
+            # # Debug: Check for -inf in the sampled logprobs
+            # jax.debug.print("logprobs_f min/max: {} / {}", jnp.min(logprobs_f), jnp.max(logprobs_f))
+            # jax.debug.print("logprobs_b min/max: {} / {}", jnp.min(logprobs_b), jnp.max(logprobs_b))
+            # jax.debug.print("logprobs_f has -inf: {}", jnp.any(jnp.isinf(logprobs_f)))
+            # jax.debug.print("logprobs_b has -inf: {}", jnp.any(jnp.isinf(logprobs_b)))
             
             # Get logZ
             logZ = params.get('logZ', jnp.array(0.0))
