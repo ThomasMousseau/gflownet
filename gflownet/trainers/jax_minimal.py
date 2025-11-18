@@ -34,7 +34,7 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
     
     # Get trajectory indices (consecutive numbering for grouping)
     traj_indices = pytorch_batch.get_trajectory_indices(consecutive=True)
-    trajectory_indices = jnp.array(traj_indices.detach().cpu().numpy())
+    trajectory_indices = jnp.array(traj_indices.detach().cpu().numpy(), dtype=jnp.int32)
     
     # Compute n_trajs concretely (outside JIT)
     traj_indices_np = traj_indices.detach().cpu().numpy()
@@ -43,11 +43,11 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
     # Get states for policy input
     states_policy = pytorch_batch.get_states(policy=True)
     if isinstance(states_policy, torch.Tensor):
-        states = jnp.array(states_policy.detach().cpu().numpy())
+        states = jnp.array(states_policy.detach().cpu().numpy(), dtype=jnp.float32)
     else:
         # Handle list of states
         states = jnp.array([s.detach().cpu().numpy() if isinstance(s, torch.Tensor) else s 
-                           for s in states_policy])
+                           for s in states_policy], dtype=jnp.float32)
     
     # Get actions
     actions_list = pytorch_batch.get_actions()
@@ -58,23 +58,42 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
         # If no proxy, use dummy rewards (all zeros)
         # This shouldn't happen in real training but helps with testing
         print("WARNING: Batch has no proxy, using zero rewards")
-        terminating_rewards = jnp.zeros(pytorch_batch.get_n_trajectories())
+        terminating_rewards = jnp.zeros(pytorch_batch.get_n_trajectories(), dtype=jnp.float32)
     else:
         terminating_rewards_tensor = pytorch_batch.get_terminating_rewards(sort_by="trajectory")
-        terminating_rewards = jnp.array(terminating_rewards_tensor.detach().cpu().numpy())
+        terminating_rewards = jnp.array(terminating_rewards_tensor.detach().cpu().numpy(), dtype=jnp.float32)
     
     # For compatibility with existing code, also get all rewards (but we'll use terminating)
     rewards_tensor = pytorch_batch.get_rewards()
-    rewards = jnp.array(rewards_tensor.detach().cpu().numpy())
+    rewards = jnp.array(rewards_tensor.detach().cpu().numpy(), dtype=jnp.float32)
     
     logrewards_tensor = pytorch_batch.get_terminating_rewards(log=True, sort_by="trajectory")
-    logrewards = jnp.array(logrewards_tensor.detach().cpu().numpy())
+    logrewards = jnp.array(logrewards_tensor.detach().cpu().numpy(), dtype=jnp.float32)
     
     # Get logprobs (forward and backward)
     logprobs_fwd, _ = pytorch_batch.get_logprobs(backward=False)
     logprobs_bwd, _ = pytorch_batch.get_logprobs(backward=True)
-    logprobs = jnp.array(logprobs_fwd.detach().cpu().numpy())
-    logprobs_rev = jnp.array(logprobs_bwd.detach().cpu().numpy())
+    logprobs = jnp.array(logprobs_fwd.detach().cpu().numpy(), dtype=jnp.float32)
+    logprobs_rev = jnp.array(logprobs_bwd.detach().cpu().numpy(), dtype=jnp.float32)
+    
+    parents_policy = pytorch_batch.get_parents(policy=True)
+    if isinstance(parents_policy, torch.Tensor):
+        parents_policy = jnp.array(parents_policy.detach().cpu().numpy(), dtype=jnp.float32)
+    else:
+        parents_policy = jnp.array([p.detach().cpu().numpy() if isinstance(p, torch.Tensor) else p for p in parents_policy], dtype=jnp.float32)
+
+    # Add masks_forward (of parents, for forward logprobs)
+    masks_forward = pytorch_batch.get_masks_forward(of_parents=True)
+    masks_forward = jnp.array(masks_forward.detach().cpu().numpy())  # Bool, no dtype needed
+
+    # Add masks_backward (of states, for backward logprobs)
+    masks_backward = pytorch_batch.get_masks_backward()
+    masks_backward = jnp.array(masks_backward.detach().cpu().numpy())  # Bool, no dtype needed
+
+    # Debug: Check for issues
+    # print(f"parents_policy shape: {parents_policy.shape}, sample: {parents_policy[:2] if parents_policy.size > 0 else 'empty'}")
+    # print(f"masks_forward shape: {masks_forward.shape}, any True: {jnp.any(masks_forward)}")
+    # print(f"masks_backward shape: {masks_backward.shape}, any True: {jnp.any(masks_backward)}")
     
     return {
         'states': states,
@@ -87,6 +106,9 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
         'trajectory_indices': trajectory_indices,
         'n_trajs': n_trajs, 
         'logrewards': logrewards,
+        'parents_policy': parents_policy,
+        'masks_forward': masks_forward,
+        'masks_backward': masks_backward,
     }
 
 
@@ -133,34 +155,34 @@ def convert_params_to_jax(agent, config, key):
             jax_model_f = eqx.tree_at(
                 lambda m: m.layers[0].weight,
                 jax_model_f,
-                jnp.array(pt_model_f[0].weight.detach().cpu().numpy()),
+                jnp.array(pt_model_f[0].weight.detach().cpu().numpy(), dtype=jnp.float32),
             )
             jax_model_f = eqx.tree_at(
                 lambda m: m.layers[0].bias,
                 jax_model_f,
-                jnp.array(pt_model_f[0].bias.detach().cpu().numpy()),
+                jnp.array(pt_model_f[0].bias.detach().cpu().numpy(), dtype=jnp.float32),
             )
 
             jax_model_f = eqx.tree_at(
                 lambda m: m.layers[2].weight,
                 jax_model_f,
-                jnp.array(pt_model_f[2].weight.detach().cpu().numpy()),
+                jnp.array(pt_model_f[2].weight.detach().cpu().numpy(), dtype=jnp.float32),
             )
             jax_model_f = eqx.tree_at(
                 lambda m: m.layers[2].bias,
                 jax_model_f,
-                jnp.array(pt_model_f[2].bias.detach().cpu().numpy()),
+                jnp.array(pt_model_f[2].bias.detach().cpu().numpy(), dtype=jnp.float32),
             )
 
             jax_model_f = eqx.tree_at(
                 lambda m: m.layers[4].weight,
                 jax_model_f,
-                jnp.array(pt_model_f[4].weight.detach().cpu().numpy()),
+                jnp.array(pt_model_f[4].weight.detach().cpu().numpy(), dtype=jnp.float32),
             )
             jax_model_f = eqx.tree_at(
                 lambda m: m.layers[4].bias,
                 jax_model_f,
-                jnp.array(pt_model_f[4].bias.detach().cpu().numpy()),
+                jnp.array(pt_model_f[4].bias.detach().cpu().numpy(), dtype=jnp.float32),
             )
 
             jax_policy_f.model = jax_model_f
@@ -211,34 +233,34 @@ def convert_params_to_jax(agent, config, key):
             jax_model_b = eqx.tree_at(
                 lambda m: m.layers[0].weight,
                 jax_model_b,
-                jnp.array(pt_model_b[0].weight.detach().cpu().numpy()),
+                jnp.array(pt_model_b[0].weight.detach().cpu().numpy(), dtype=jnp.float32),
             )
             jax_model_b = eqx.tree_at(
                 lambda m: m.layers[0].bias,
                 jax_model_b,
-                jnp.array(pt_model_b[0].bias.detach().cpu().numpy()),
+                jnp.array(pt_model_b[0].bias.detach().cpu().numpy(), dtype=jnp.float32),
             )
 
             jax_model_b = eqx.tree_at(
                 lambda m: m.layers[2].weight,
                 jax_model_b,
-                jnp.array(pt_model_b[2].weight.detach().cpu().numpy()),
+                jnp.array(pt_model_b[2].weight.detach().cpu().numpy(), dtype=jnp.float32),
             )
             jax_model_b = eqx.tree_at(
                 lambda m: m.layers[2].bias,
                 jax_model_b,
-                jnp.array(pt_model_b[2].bias.detach().cpu().numpy()),
+                jnp.array(pt_model_b[2].bias.detach().cpu().numpy(), dtype=jnp.float32),
             )
 
             jax_model_b = eqx.tree_at(
                 lambda m: m.layers[4].weight,
                 jax_model_b,
-                jnp.array(pt_model_b[4].weight.detach().cpu().numpy()),
+                jnp.array(pt_model_b[4].weight.detach().cpu().numpy(), dtype=jnp.float32),
             )
             jax_model_b = eqx.tree_at(
                 lambda m: m.layers[4].bias,
                 jax_model_b,
-                jnp.array(pt_model_b[4].bias.detach().cpu().numpy()),
+                jnp.array(pt_model_b[4].bias.detach().cpu().numpy(), dtype=jnp.float32),
             )
 
             jax_policy_b.model = jax_model_b
@@ -254,7 +276,7 @@ def convert_params_to_jax(agent, config, key):
     # logZ
     # ------------------------------------------------------------------
     if agent.logZ is not None:
-        jax_params["logZ"] = jnp.array(agent.logZ.detach().cpu().numpy())
+        jax_params["logZ"] = jnp.array(agent.logZ.detach().cpu().numpy(), dtype=jnp.float32)
     else:
         jax_params["logZ"] = None
 
@@ -338,10 +360,6 @@ def train(agent, config):
     2. Only convert gradient computation to JAX
     3. Sync parameters between PyTorch and JAX each iteration
     """
-    #! TEMPORARY TESTING SETTING
-    # print(f"JAX: sttr={agent.sttr}, ttsr={agent.ttsr}, batch_size.forward={agent.batch_size.forward}, train_to_sample_ratio={config.gflownet.optimizer.train_to_sample_ratio}")
-    # agent.sttr = 3
-    
     
     # Setup Optax optimizer with separate LR for logZ
     lr_schedule_main = optax.piecewise_constant_schedule(
@@ -416,26 +434,43 @@ def train(agent, config):
             else:
                 model_b = jax_policies['backward'].model
             
-            # Compute fresh log-probs from JAX models (not pre-computed batch log-probs)
-            logits_f = jax.vmap(model_f)(batch_arrays['states_policy'])
-            logprobs_f_all = jax.nn.log_softmax(logits_f, axis=1)
+            #Compute fresh log-probs from JAX models (not pre-computed batch log-probs)
+            logits_f = jax.vmap(model_f)(batch_arrays['parents_policy'])
+            logits_f_masked = jnp.where(batch_arrays['masks_forward'], logits_f, 0.0)  #! When -inf is used, softmax gives NaN if all invalid
+            logprobs_f_all = jax.nn.log_softmax(logits_f_masked, axis=1)
             logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
-            
+
             logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
-            logprobs_b_all = jax.nn.log_softmax(logits_b, axis=1)
+            logits_b_masked = jnp.where(batch_arrays['masks_backward'], logits_b, 0.0)  #! When -inf is used, softmax gives NaN if all invalid
+            logprobs_b_all = jax.nn.log_softmax(logits_b_masked, axis=1)
             logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
+            
+            # logits_f = jax.vmap(model_f)(batch_arrays['parents_policy'])
+            # logprobs_f_all = jax.nn.log_softmax(logits_f, axis=1)  # No masking
+            # logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
+
+            # # Same for backward
+            # logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
+            # logprobs_b_all = jax.nn.log_softmax(logits_b, axis=1)  # No masking
+            # logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
+            
+            # Debug: Check for NaN in logits
+            # if debug:
+            #     jax.debug.print("logits_f has NaN: {}", jnp.any(jnp.isnan(logits_f)))
+            #     jax.debug.print("logits_b has NaN: {}", jnp.any(jnp.isnan(logits_b)))
+            #     jax.debug.print("logits_f has inf: {}", jnp.any(jnp.isinf(logits_f)))
+            #     jax.debug.print("logits_b has inf: {}", jnp.any(jnp.isinf(logits_b)))
             
             # Get logZ
             logZ = params.get('logZ', jnp.array(0.0))
             if logZ is not None and logZ.ndim > 0:
                 logZ = jnp.sum(logZ)
             
-            # Compute trajectory log-prob ratios (similar to original compute_logprobs_trajectories)
             traj_indices = batch_arrays['trajectory_indices']
-            # n_trajs = int(jnp.max(traj_indices)) + 1
             
             def compute_traj_logprob_ratio(traj_idx):
                 mask = (traj_indices == traj_idx).astype(jnp.float32)
+                #TODO: LET'S MINE!
                 log_pF = jnp.sum(logprobs_f * mask)
                 log_pB = jnp.sum(logprobs_b * mask)
                 return log_pF - log_pB
@@ -443,6 +478,10 @@ def train(agent, config):
             #logprob_ratios = jax.vmap(compute_traj_logprob_ratio)(jnp.arange(n_trajs))
             logprob_ratios = jnp.array([compute_traj_logprob_ratio(tidx) for tidx in jnp.arange(n_trajs)])
             log_rewards = batch_arrays['logrewards']
+            
+            # jax.debug.print("logZ: {}", logZ)
+            # jax.debug.print("logprob_ratios sample: {}", logprob_ratios[:5])
+            # jax.debug.print("log_rewards sample: {}", log_rewards[:5])
             
             losses = (logZ + logprob_ratios - log_rewards) ** 2
             return jnp.mean(losses)
@@ -457,14 +496,12 @@ def train(agent, config):
         JIT-compiled gradient step.
         This is the ONLY function that needs to be pure JAX.
         """
-        # Compute loss and gradients
+        
         loss_value, grads = value_and_grad(jax_loss_wrapper)(
             params, batch_arrays, loss_type=loss_type, n_trajs=n_trajs
         )
         
-        # loss_value, grads = value_and_grad(jax_loss_wrapper)(
-        #     params, batch_arrays, loss_type=loss_type, n_trajs=n_trajs
-        # )
+        # jax.debug.print("loss_value before NaN check: {}", loss_value)
         
         # loss_value = jax_loss_wrapper(params, batch_arrays, loss_type=loss_type, n_trajs=n_trajs, debug=True)
         # grads = grad(lambda p: jax_loss_wrapper(p, batch_arrays, loss_type=loss_type, n_trajs=n_trajs, debug=False))(params)
@@ -472,11 +509,6 @@ def train(agent, config):
         # Apply optimizer update
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        
-        # print(f"grads logZ: {grads.get('logZ')}")
-        # print(f"updates logZ: {updates.get('logZ')}")
-        # print(f"logZ before: {params.get('logZ')}")
-        # print(f"logZ after: {new_params.get('logZ')}")
         
         return new_params, new_opt_state, loss_value, grads
     
@@ -498,9 +530,6 @@ def train(agent, config):
         
         # Sample batch (PyTorch)
         for _ in range(agent.sttr):
-            # if iteration % 100 == 0:
-            #     replay_len = len(agent.buffer.replay) if agent.buffer.replay is not None else 0
-            #     print(f"Iter {iteration}: backward_replay config = {agent.batch_size.backward_replay}, replay buffer len = {replay_len}")
             sub_batch, _ = agent.sample_batch(
                 n_forward=agent.batch_size.forward,
                 n_train=agent.batch_size.backward_dataset,
@@ -543,9 +572,6 @@ def train(agent, config):
         
         # # Update replay buffer
         # agent.buffer.add(states_term, actions_trajectories, rewards, iteration, buffer="replay")
-        
-        # print(f"PyTorch model weight sample: {agent.forward_policy.model[0].weight.data[0,0]}")
-        # print(f"JAX model weight sample: {jax_params['forward_policy_trainable']['layers']['0']['weight'][0,0]}")
         
         # if iteration <= 5:
         #     print(f"JAX Iteration {iteration}: logZ sum = {jnp.sum(jax_params['logZ']):.4f}")
