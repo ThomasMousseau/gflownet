@@ -1341,62 +1341,62 @@ class GFlowNetAgent:
             print("\nCheckpoint loaded into GFlowNet agent\n")
 
 #! TO UNCOMMENT AFTER OPTAX DEBUGGING
-# def make_opt(params, logZ, config):
-#     """
-#     Set up the optimizer
-#     """
-#     params = params
-#     if not len(params):
-#         return None
-#     if config.method == "adam":
-#         opt = torch.optim.Adam(
-#             params,
-#             config.lr,
-#             betas=(config.adam_beta1, config.adam_beta2),
-#         )
-#         if logZ is not None:
-#             opt.add_param_group(
-#                 {
-#                     "params": logZ,
-#                     "lr": config.lr * config.lr_z_mult,
-#                 }
-#             )
-#     elif config.method == "msgd":
-#         opt = torch.optim.SGD(params, config.lr, momentum=config.momentum)
-#     # Learning rate scheduling
-#     lr_scheduler = torch.optim.lr_scheduler.StepLR(
-#         opt,
-#         step_size=config.lr_decay_period,
-#         gamma=config.lr_decay_gamma,
-#     )
-#     return opt, lr_scheduler
-
 def make_opt(params, logZ, config):
     """
-    Set up the optimizer - HARD-CODED FOR DEBUGGING
+    Set up the optimizer
     """
     params = params
     if not len(params):
         return None
-    
-    # HARD-CODED VALUES - must match JAX exactly
-    lr_main = 0.0001
-    lr_logz = 0.001
-    
-    opt = torch.optim.SGD(params, lr=lr_main)
-    
-    if logZ is not None:
-        opt.add_param_group(
-            {
-                "params": logZ,
-                "lr": lr_logz,  # Hard-coded 10x
-            }
+    if config.method == "adam":
+        opt = torch.optim.Adam(
+            params,
+            config.lr,
+            betas=(config.adam_beta1, config.adam_beta2),
         )
-    
-    # Dummy scheduler that does nothing
+        if logZ is not None:
+            opt.add_param_group(
+                {
+                    "params": logZ,
+                    "lr": config.lr * config.lr_z_mult,
+                }
+            )
+    elif config.method == "msgd":
+        opt = torch.optim.SGD(params, config.lr, momentum=config.momentum)
+    # Learning rate scheduling
     lr_scheduler = torch.optim.lr_scheduler.StepLR(
         opt,
-        step_size=999999,
-        gamma=1.0,
+        step_size=config.lr_decay_period,
+        gamma=config.lr_decay_gamma,
     )
     return opt, lr_scheduler
+
+# def make_opt(params, logZ, config):
+#     """
+#     Set up the optimizer - HARD-CODED FOR DEBUGGING
+#     """
+#     params = params
+#     if not len(params):
+#         return None
+    
+#     # HARD-CODED VALUES - must match JAX exactly
+#     lr_main = 0.0001
+#     lr_logz = 0.001
+    
+#     opt = torch.optim.SGD(params, lr=lr_main)
+    
+#     if logZ is not None:
+#         opt.add_param_group(
+#             {
+#                 "params": logZ,
+#                 "lr": lr_logz,  # Hard-coded 10x
+#             }
+#         )
+    
+#     # Dummy scheduler that does nothing
+#     lr_scheduler = torch.optim.lr_scheduler.StepLR(
+#         opt,
+#         step_size=999999,
+#         gamma=1.0,
+#     )
+#     return opt, lr_scheduler
