@@ -21,6 +21,7 @@ from tqdm import tqdm, trange
 
 from gflownet.envs.base import GFlowNetEnv
 from gflownet.evaluator.base import BaseEvaluator
+from gflownet.trainers.jax_minimal import convert_params_to_jax
 from gflownet.utils.batch import Batch, compute_logprobs_trajectories
 from gflownet.utils.common import (
     bootstrap_samples,
@@ -929,9 +930,19 @@ class GFlowNetAgent:
         pbar2.close()
         return logprobs_estimates, logprobs_std, probs_std
 
-    def train(self):
+    def train(self, config):
+
+        #! JAX conversion debugging
+        from gflownet.trainers.jax_minimal import (
+            convert_params_to_jax,
+            apply_params_to_pytorch,
+            sync_params_from_pytorch_to_jax,
+        )
+        import jax
+        key = jax.random.PRNGKey(0)
+        jax_params, jax_policies = convert_params_to_jax(self, config, key)  # config not needed here
+    
         # Train loop
-        print(f"PyTorch: sttr={self.sttr}, ttsr={self.ttsr}, batch_size.forward={self.batch_size.forward}")
         pbar = tqdm(
             initial=self.it - 1,
             total=self.n_train_steps,
@@ -943,6 +954,9 @@ class GFlowNetAgent:
                 self.evaluator.eval_and_log(self.it)
             if self.evaluator.should_eval_top_k(self.it):
                 self.evaluator.eval_and_log_top_k(self.it)
+                
+            #! JAX conversion debugging
+            apply_params_to_pytorch(jax_params, self, jax_policies)
 
             t0_iter = time.time()
             batch = Batch(
@@ -961,10 +975,6 @@ class GFlowNetAgent:
                 )
                 batch.merge(sub_batch)
                 
-            #! Debug print to see if we were sampling from replay buffer
-            # replay_len = len(self.buffer.replay) if hasattr(self.buffer, 'replay') and self.buffer.replay is not None else 0
-            # print(f"Iter {self.it}: backward_replay config = {self.batch_size.backward_replay}, replay buffer len = {replay_len}")
-    
             for j in range(self.ttsr):
                 losses = self.loss.compute(batch, get_sublosses=True)
                 # TODO: deal with this in a better way
@@ -972,33 +982,24 @@ class GFlowNetAgent:
                     if self.logger.debug:
                         print("Loss is not finite - skipping iteration")
                 #! COMMENTED OUT TO DEBUG GRADIENT ISSUE
-                # else:
-                    #losses["all"].backward()
-                    # if self.clip_grad_norm > 0:
-                    #     torch.nn.utils.clip_grad_norm_(
-                    #         self.parameters(), self.clip_grad_norm
-                    #     )
-                    # self.grad_logz_mean = self.logZ.grad.mean().item() 
-                    # self.opt.step()
-                    # self.lr_scheduler.step()
-                    # self.opt.zero_grad()
-                    # batch.zero_logprobs()
+                else:
+                    losses["all"].backward()
+                    if self.clip_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.parameters(), self.clip_grad_norm
+                        )
+                    self.grad_logz_mean = self.logZ.grad.mean().item() 
+                    self.opt.step()
+                    self.lr_scheduler.step()
+                    self.opt.zero_grad()
+                    batch.zero_logprobs()
+                    
+            #! JAX conversion debugging
+            jax_params, jax_policies = sync_params_from_pytorch_to_jax(
+                self, jax_params, jax_policies
+            )
 
-            # Log training iteration: progress bar, buffer, metrics, intermediate
-            # models
             times = self.log_train_iteration(pbar, losses, batch, times)
-
-            # Debug: Print parameters for first 5 iterations
-            if self.it <= 5:
-                print(f"PyTorch Iteration {self.it}: logZ sum = {self.logZ.sum().item():.4f}")
-
-            # Debug: Loss components for iteration 1
-            if self.it == 1:
-                from gflownet.utils.batch import compute_logprobs_trajectories
-                logprobs_f = compute_logprobs_trajectories(batch, forward_policy=self.forward_policy, backward=False)
-                logprobs_b = compute_logprobs_trajectories(batch, backward_policy=self.backward_policy, backward=True)
-                logrewards = batch.get_terminating_rewards(log=True, sort_by="trajectory")
-                print(f"PyTorch Traj 0: log_pF={logprobs_f[0]:.4f}, log_pB={logprobs_b[0]:.4f}, log_R={logrewards[0]:.4f}, logZ={self.logZ.sum():.4f}")
 
             # Log times
             t1_iter = time.time()
@@ -1036,6 +1037,7 @@ class GFlowNetAgent:
         # Close logger
         if self.use_context is False:
             self.logger.end()
+    
 
     @torch.no_grad()
     def log_train_iteration(self, pbar: tqdm, losses: List, batch: Batch, times: dict):

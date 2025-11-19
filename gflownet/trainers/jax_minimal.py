@@ -512,10 +512,10 @@ def train(agent, config):
                 
         #! Apply optimizer update
         #! COMMENTED OUT FOR DEBUGGING
-        # updates, new_opt_state = optimizer.update(grads, opt_state, params)
-        # new_params = optax.apply_updates(params, updates)
-        new_opt_state = opt_state
-        new_params = params
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        # new_opt_state = opt_state
+        # new_params = params
         
         return new_params, new_opt_state, loss_value, grads
     
@@ -722,3 +722,76 @@ def train(agent, config):
     print("=" * 80)
     
     return agent
+
+#! DEBUGGING PURPOSES
+#! DEBUGGING PURPOSES
+def sync_params_from_pytorch_to_jax(agent, jax_params, jax_policies):
+    """
+    Sync parameters from PyTorch agent back to JAX params dict.
+    This is the reverse of apply_params_to_pytorch.
+    """
+    import equinox as eqx
+    
+    # Sync logZ
+    if agent.logZ is not None:
+        jax_params["logZ"] = jnp.array(
+            agent.logZ.detach().cpu().numpy(), dtype=jnp.float32
+        )
+    
+    # Sync forward policy
+    if agent.forward_policy.is_model:
+        pt_model_f = agent.forward_policy.model
+        # Get the current JAX model (combine trainable + static)
+        jax_model_f = eqx.combine(
+            jax_params["forward_policy_trainable"],
+            jax_policies["forward_static"]
+        )
+        
+        # Update each LINEAR layer (indices 0, 2, 4 in both PyTorch and JAX)
+        for pt_layer_idx in [0, 2, 4]:
+            pt_layer = pt_model_f[pt_layer_idx]
+            weight = jnp.array(pt_layer.weight.detach().cpu().numpy(), dtype=jnp.float32)
+            bias = jnp.array(pt_layer.bias.detach().cpu().numpy(), dtype=jnp.float32)
+            
+            # Update the layer - use pt_layer_idx for JAX too (not i)
+            jax_model_f = eqx.tree_at(
+                lambda m: (m.layers[pt_layer_idx].weight, m.layers[pt_layer_idx].bias),
+                jax_model_f,
+                (weight, bias),
+                is_leaf=lambda x: x is None  # Treat None as leaf
+            )
+        
+        # Re-partition into trainable and static
+        trainable_f, static_f = eqx.partition(jax_model_f, eqx.is_array)
+        jax_params["forward_policy_trainable"] = trainable_f
+        jax_policies["forward_static"] = static_f
+    
+    # Sync backward policy (same fix)
+    if agent.backward_policy.is_model:
+        pt_model_b = agent.backward_policy.model
+        # Get the current JAX model
+        jax_model_b = eqx.combine(
+            jax_params["backward_policy_trainable"],
+            jax_policies["backward_static"]
+        )
+        
+        # Update each LINEAR layer (indices 0, 2, 4)
+        for pt_layer_idx in [0, 2, 4]:
+            pt_layer = pt_model_b[pt_layer_idx]
+            weight = jnp.array(pt_layer.weight.detach().cpu().numpy(), dtype=jnp.float32)
+            bias = jnp.array(pt_layer.bias.detach().cpu().numpy(), dtype=jnp.float32)
+            
+            # Update the layer - use pt_layer_idx for JAX too
+            jax_model_b = eqx.tree_at(
+                lambda m: (m.layers[pt_layer_idx].weight, m.layers[pt_layer_idx].bias),
+                jax_model_b,
+                (weight, bias),
+                is_leaf=lambda x: x is None  # Treat None as leaf
+            )
+        
+        # Re-partition
+        trainable_b, static_b = eqx.partition(jax_model_b, eqx.is_array)
+        jax_params["backward_policy_trainable"] = trainable_b
+        jax_policies["backward_static"] = static_b
+    
+    return jax_params, jax_policies
