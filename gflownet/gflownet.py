@@ -978,11 +978,11 @@ class GFlowNetAgent:
                 
             for j in range(self.ttsr):
                 
-                #! TO COMMENT AFTER RNG DEBUGGING
-                if self.it == 1:
-                    saved_batch = batch 
-                if self.it <= 10:
-                    batch = saved_batch
+                # #! TO COMMENT AFTER RNG DEBUGGING
+                # if self.it == 1:
+                #     saved_batch = batch 
+                # if self.it <= 10:
+                #     batch = saved_batch
     
                 losses = self.loss.compute(batch, get_sublosses=True)
                 # TODO: deal with this in a better way
@@ -1002,7 +1002,7 @@ class GFlowNetAgent:
                     print(f"PyTorch grad_forward_layer0_norm: {torch.norm(self.forward_policy.model[0].weight.grad):.10f}")
                     self.opt.zero_grad()
                     # !UNCOMMENT AFTER RNG DEBUGGING
-                    #batch.zero_logprobs()
+                    batch.zero_logprobs()
                     
                     
             #! JAX conversion debugging

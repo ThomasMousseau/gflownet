@@ -104,20 +104,6 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
     masks_forward = jnp.array(masks_forward_pt.detach().cpu().numpy())
     masks_backward = jnp.array(masks_backward_pt.detach().cpu().numpy())
     
-    # for i in range(min(5, len(pytorch_batch))):
-    #     action = pytorch_batch.actions[i]
-    #     traj_idx = pytorch_batch.traj_indices[i]
-    #     env = pytorch_batch.envs[traj_idx]
-        
-    #     if isinstance(action, tuple):
-    #         action_idx = env.action2index(action)
-    #     else:
-    #         action_idx = action
-        
-    #     mask_f = masks_forward_pt[i]
-    #     mask_b = masks_backward_pt[i]
-    #     print(f"Sample {i}: action={action}, action_idx={action_idx}, mask_f[action]={mask_f[action_idx]}, mask_b[action]={mask_b[action_idx]}")
-    
     return {
         'states': states,
         'states_policy': states,
@@ -397,16 +383,20 @@ def train(agent, config):
         decay_rate=config.gflownet.optimizer.lr_decay_gamma,
         staircase=True
     )
+    
+    # max_grad_norm = 0.0001
 
     optimizer = optax.multi_transform(
         {
-            'main': optax.adam(
-                learning_rate=lr_schedule_main,
-                b1=config.gflownet.optimizer.adam_beta1,
-                b2=config.gflownet.optimizer.adam_beta2,
-                eps=1e-8, # like in torch.optim.Adam
-                eps_root=0.0,
-                
+            'main': optax.chain(
+                # optax.clip_by_global_norm(max_grad_norm), 
+                optax.adam(
+                    learning_rate=lr_schedule_main,
+                    b1=config.gflownet.optimizer.adam_beta1,
+                    b2=config.gflownet.optimizer.adam_beta2,
+                    eps=1e-8,
+                    eps_root=0.0,
+                ),
             ),
             'logz': optax.adam(
                 learning_rate=lr_schedule_logz,
@@ -471,42 +461,40 @@ def train(agent, config):
                 model_b = eqx.combine(params['backward_policy_trainable'], jax_policies['backward_static'])
             else:
                 model_b = jax_policies['backward'].model
-                                
-            # logits_f = jax.vmap(model_f)(batch_arrays['parents_policy'])
-            # logits_f_masked = jnp.where(batch_arrays['masks_forward'], -jnp.inf, logits_f)
-            # logprobs_f_all = jax.nn.log_softmax(logits_f_masked, axis=1)
-            # logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
-
-            # logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
-            # logits_b_masked = jnp.where(batch_arrays['masks_backward'], -jnp.inf, logits_b)
-            # logprobs_b_all = jax.nn.log_softmax(logits_b_masked, axis=1)
-            # logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
             
-            #! TO COMMENT OUT FOR DEBUGGING
-            logprobs_f = batch_arrays['logprobs']       # Collected during sampling
-            logprobs_b = batch_arrays['logprobs_rev']
-        
             # Get logZ
             logZ = params.get('logZ', jnp.array(0.0))
             if logZ is not None and logZ.ndim > 0:
                 logZ = jnp.sum(logZ)
+                                
+            logits_f = jax.vmap(model_f)(batch_arrays['parents_policy'])
+            logits_f_masked = jnp.where(batch_arrays['masks_forward'], -jnp.inf, logits_f)
+            logprobs_f_all = jax.nn.log_softmax(logits_f_masked, axis=1)
+            logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
+
+            logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
+            logits_b_masked = jnp.where(batch_arrays['masks_backward'], -jnp.inf, logits_b)
+            logprobs_b_all = jax.nn.log_softmax(logits_b_masked, axis=1)
+            logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
+            
+            # logprobs_f = batch_arrays['logprobs']
+            # logprobs_b = batch_arrays['logprobs_rev']
             
             traj_indices = batch_arrays['trajectory_indices']
             
-            # def compute_traj_logprob_ratio(traj_idx):
-            #     mask = (traj_indices == traj_idx).astype(jnp.float32)
-            #     #TODO: LET'S MINE!
-            #     log_pF = jnp.sum(logprobs_f * mask)
-            #     log_pB = jnp.sum(logprobs_b * mask)
-            #     return log_pF - log_pB
-            # logprob_ratios = jax.vmap(compute_traj_logprob_ratio)(jnp.arange(n_trajs))
+            def compute_traj_logprob_ratio(traj_idx):
+                mask = (traj_indices == traj_idx).astype(jnp.float32)
+                #TODO: LET'S MINE!
+                log_pF = jnp.sum(logprobs_f * mask)
+                log_pB = jnp.sum(logprobs_b * mask)
+                return log_pF - log_pB
+            logprob_ratios = jax.vmap(compute_traj_logprob_ratio)(jnp.arange(n_trajs))
             # logprob_ratios = jnp.array([compute_traj_logprob_ratio(tidx) for tidx in jnp.arange(n_trajs)])
             
-            traj_one_hot = jax.nn.one_hot(traj_indices, n_trajs, dtype=jnp.float32)  # shape: (batch_size, n_trajs)
-            log_pF_per_traj = jnp.sum(logprobs_f[:, None] * traj_one_hot, axis=0)  # shape: (n_trajs,)
-            log_pB_per_traj = jnp.sum(logprobs_b[:, None] * traj_one_hot, axis=0)  # shape: (n_trajs,)
-
-            logprob_ratios = log_pF_per_traj - log_pB_per_traj
+            # traj_one_hot = jax.nn.one_hot(traj_indices, n_trajs, dtype=jnp.float32)  # shape: (batch_size, n_trajs)
+            # log_pF_per_traj = jnp.sum(logprobs_f[:, None] * traj_one_hot, axis=0)  # shape: (n_trajs,)
+            # log_pB_per_traj = jnp.sum(logprobs_b[:, None] * traj_one_hot, axis=0)  # shape: (n_trajs,)
+            # logprob_ratios = log_pF_per_traj - log_pB_per_traj
             
             jax.debug.print("Using vmap (not list comp): logprob_ratios shape: {}", logprob_ratios.shape)
             log_rewards = batch_arrays['logrewards']
@@ -592,11 +580,11 @@ def train(agent, config):
         # Convert batch to JAX arrays
         batch_arrays = convert_batch_to_jax_arrays(batch)
         
-        #! TO COMMENT AFTER RNG DEBUGGING
-        if iteration == 1:
-            saved_batch_arrays = batch_arrays.copy()
-        if iteration <= 10:
-            batch_arrays = saved_batch_arrays
+        # #! TO COMMENT AFTER RNG DEBUGGING
+        # if iteration == 1:
+        #     saved_batch_arrays = batch_arrays.copy()
+        # if iteration <= 10:
+        #     batch_arrays = saved_batch_arrays
         
         n_trajs = batch_arrays.get('n_trajs') 
         
