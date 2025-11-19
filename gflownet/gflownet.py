@@ -971,17 +971,18 @@ class GFlowNetAgent:
                 if not all([torch.isfinite(loss) for loss in losses.values()]):
                     if self.logger.debug:
                         print("Loss is not finite - skipping iteration")
-                else:
-                    losses["all"].backward()
-                    if self.clip_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.parameters(), self.clip_grad_norm
-                        )
-                    self.grad_logz_mean = self.logZ.grad.mean().item() 
-                    self.opt.step()
-                    self.lr_scheduler.step()
-                    self.opt.zero_grad()
-                    batch.zero_logprobs()
+                #! COMMENTED OUT TO DEBUG GRADIENT ISSUE
+                # else:
+                    #losses["all"].backward()
+                    # if self.clip_grad_norm > 0:
+                    #     torch.nn.utils.clip_grad_norm_(
+                    #         self.parameters(), self.clip_grad_norm
+                    #     )
+                    # self.grad_logz_mean = self.logZ.grad.mean().item() 
+                    # self.opt.step()
+                    # self.lr_scheduler.step()
+                    # self.opt.zero_grad()
+                    # batch.zero_logprobs()
 
             # Log training iteration: progress bar, buffer, metrics, intermediate
             # models
@@ -1151,7 +1152,8 @@ class GFlowNetAgent:
                     "logZ": logz,
                     "Learning rate": learning_rates[0],
                     "Learning rate logZ": learning_rates[1],
-                    "grad_logZ_mean": self.grad_logz_mean 
+                    #! COMMENTED OUT TO DEBUG GRADIENT ISSUE
+                    # "grad_logZ_mean": self.grad_logz_mean 
                 },
                 step=self.it,
                 use_context=self.use_context,

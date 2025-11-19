@@ -415,7 +415,6 @@ def train(agent, config):
             ),
         },
         {
-            # Map parameter keys to transforms
             'forward_policy_trainable': 'main',
             'backward_policy_trainable': 'main',
             'logZ': 'logz'
@@ -456,40 +455,15 @@ def train(agent, config):
             else:
                 model_b = jax_policies['backward'].model
                     
-            # logits_f = jax.vmap(model_f)(batch_arrays['parents_policy'])
-            # logits_f_masked = jnp.where(batch_arrays['masks_forward'], logits_f, 0.0)  #! When -inf is used, softmax gives NaN if all invalid
-            # logprobs_f_all = jax.nn.log_softmax(logits_f_masked, axis=1)
-            # logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
-
-            # logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
-            # logits_b_masked = jnp.where(batch_arrays['masks_backward'], logits_b, 0.0)  #! When -inf is used, softmax gives NaN if all invalid
-            # logprobs_b_all = jax.nn.log_softmax(logits_b_masked, axis=1)
-            # logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
-            
             logits_f = jax.vmap(model_f)(batch_arrays['parents_policy'])
             logits_f_masked = jnp.where(batch_arrays['masks_forward'], -jnp.inf, logits_f)
             logprobs_f_all = jax.nn.log_softmax(logits_f_masked, axis=1)
             logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
             
-            # jax.debug.print("Sample action indices: {}", batch_arrays['actions'][:5])
-            # jax.debug.print("Sample logprobs_f_all[0]: {}", logprobs_f_all[0])
-            # jax.debug.print("Indexed logprob for sample 0: {}", logprobs_f_all[0, batch_arrays['actions'][0]])
-
-
             logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
             logits_b_masked = jnp.where(batch_arrays['masks_backward'], -jnp.inf, logits_b)
             logprobs_b_all = jax.nn.log_softmax(logits_b_masked, axis=1)
             logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
-        
-            # jax.debug.print("Sample action indices: {}", batch_arrays['actions'][:5])
-            # jax.debug.print("Sample logprobs_b_all[0]: {}", logprobs_b_all[0])
-            # jax.debug.print("Indexed logprob for sample 0: {}", logprobs_b_all[0, batch_arrays['actions'][0]])
-
-            # # Debug: Check for -inf in the sampled logprobs
-            # jax.debug.print("logprobs_f min/max: {} / {}", jnp.min(logprobs_f), jnp.max(logprobs_f))
-            # jax.debug.print("logprobs_b min/max: {} / {}", jnp.min(logprobs_b), jnp.max(logprobs_b))
-            # jax.debug.print("logprobs_f has -inf: {}", jnp.any(jnp.isinf(logprobs_f)))
-            # jax.debug.print("logprobs_b has -inf: {}", jnp.any(jnp.isinf(logprobs_b)))
             
             # Get logZ
             logZ = params.get('logZ', jnp.array(0.0))
@@ -536,9 +510,12 @@ def train(agent, config):
         # loss_value = jax_loss_wrapper(params, batch_arrays, loss_type=loss_type, n_trajs=n_trajs, debug=True)
         # grads = grad(lambda p: jax_loss_wrapper(p, batch_arrays, loss_type=loss_type, n_trajs=n_trajs, debug=False))(params)
                 
-        # Apply optimizer update
-        updates, new_opt_state = optimizer.update(grads, opt_state, params)
-        new_params = optax.apply_updates(params, updates)
+        #! Apply optimizer update
+        #! COMMENTED OUT FOR DEBUGGING
+        # updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        # new_params = optax.apply_updates(params, updates)
+        new_opt_state = opt_state
+        new_params = params
         
         return new_params, new_opt_state, loss_value, grads
     
