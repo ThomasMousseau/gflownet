@@ -6,4 +6,5 @@ from typing import Any
 
 def train(agent, config: Any) -> None:
     config = config  # Unused in this wrapper
-    agent.train(config) #! Calling train method of GFlowNetAgent in gflownet/gflownet.py
+    agent.train()
+    #agent.train(config) #! Calling train method of GFlowNetAgent in gflownet/gflownet.py

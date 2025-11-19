@@ -383,36 +383,53 @@ def train(agent, config):
     2. Only convert gradient computation to JAX
     3. Sync parameters between PyTorch and JAX each iteration
     """
-    # Setup Optax optimizer with separate LR for logZ
-    lr_schedule_main = optax.piecewise_constant_schedule(
-        init_value=config.gflownet.optimizer.lr,
-        boundaries_and_scales={
-            i * config.gflownet.optimizer.lr_decay_period: config.gflownet.optimizer.lr_decay_gamma
-            for i in range(1, config.gflownet.optimizer.n_train_steps // config.gflownet.optimizer.lr_decay_period + 1)
-        }
-    )
+    # !Setup Optax optimizer with separate LR for logZ
+    # lr_schedule_main = optax.exponential_decay(
+    #     init_value=config.gflownet.optimizer.lr,
+    #     transition_steps=config.gflownet.optimizer.lr_decay_period,
+    #     decay_rate=config.gflownet.optimizer.lr_decay_gamma,
+    #     staircase=True  # ← Makes it step-wise like PyTorch StepLR
+    # )
 
-    lr_z_mult = getattr(config.gflownet.optimizer, 'lr_z_mult', 10) 
-    lr_schedule_logz = optax.piecewise_constant_schedule(
-        init_value=config.gflownet.optimizer.lr * lr_z_mult,
-        boundaries_and_scales={
-            i * config.gflownet.optimizer.lr_decay_period: config.gflownet.optimizer.lr_decay_gamma
-            for i in range(1, config.gflownet.optimizer.n_train_steps // config.gflownet.optimizer.lr_decay_period + 1)
-        }
-    )
+    # lr_schedule_logz = optax.exponential_decay(
+    #     init_value=config.gflownet.optimizer.lr * config.gflownet.optimizer.lr_z_mult,
+    #     transition_steps=config.gflownet.optimizer.lr_decay_period,
+    #     decay_rate=config.gflownet.optimizer.lr_decay_gamma,
+    #     staircase=True
+    # )
 
+    # optimizer = optax.multi_transform(
+    #     {
+    #         'main': optax.adam(
+    #             learning_rate=lr_schedule_main,
+    #             b1=config.gflownet.optimizer.adam_beta1,
+    #             b2=config.gflownet.optimizer.adam_beta2,
+    #             eps=1e-8, # like in torch.optim.Adam
+    #             eps_root=0.0,
+                
+    #         ),
+    #         'logz': optax.adam(
+    #             learning_rate=lr_schedule_logz,
+    #             b1=config.gflownet.optimizer.adam_beta1,
+    #             b2=config.gflownet.optimizer.adam_beta2,
+    #             eps=1e-8, # like in torch.optim.Adam
+    #             eps_root=0.0,
+    #         ),
+    #     },
+    #     {
+    #         'forward_policy_trainable': 'main',
+    #         'backward_policy_trainable': 'main',
+    #         'logZ': 'logz'
+    #     }
+    # )
+    
+    lr_schedule_main = 0.0001  # Hard-coded, matching PyTorch
+    lr_schedule_logz = 0.001   # Hard-coded, 10x for logZ (matching PyTorch)
+    
     optimizer = optax.multi_transform(
         {
-            'main': optax.adam(
-                learning_rate=lr_schedule_main,
-                b1=config.gflownet.optimizer.adam_beta1,
-                b2=config.gflownet.optimizer.adam_beta2,
-            ),
-            'logz': optax.adam(
-                learning_rate=lr_schedule_logz,
-                b1=config.gflownet.optimizer.adam_beta1,
-                b2=config.gflownet.optimizer.adam_beta2,
-            ),
+            'main': optax.sgd(learning_rate=lr_schedule_main),  # Simple SGD, no momentum
+            'logz': optax.sgd(learning_rate=lr_schedule_logz),
         },
         {
             'forward_policy_trainable': 'main',
@@ -640,12 +657,11 @@ def train(agent, config):
 
             # ---------- Learning rates ----------
             # Adapt this depending on how you store LR in your JAX setup.
-            # Example if you have a schedule function:
-            lr_main = float(lr_schedule_main(iteration))
 
-            # If you don't have a separate LogZ LR, just log None like the original does
-            lr_logz = float(lr_schedule_logz(iteration))
-
+            # lr_main = float(lr_schedule_main(iteration))
+            # lr_logz = float(lr_schedule_logz(iteration))
+            lr_main = float(lr_schedule_main)
+            lr_logz = float(lr_schedule_logz)
             grad_logZ = np.asarray(grads["logZ"], dtype=np.float32)
 
             # ---------- Scalar metrics exactly like original ----------

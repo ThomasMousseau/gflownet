@@ -930,17 +930,17 @@ class GFlowNetAgent:
         pbar2.close()
         return logprobs_estimates, logprobs_std, probs_std
 
-    def train(self, config):
+    def train(self):
 
         #! JAX conversion debugging
-        from gflownet.trainers.jax_minimal import (
-            convert_params_to_jax,
-            apply_params_to_pytorch,
-            sync_params_from_pytorch_to_jax,
-        )
-        import jax
-        key = jax.random.PRNGKey(0)
-        jax_params, jax_policies = convert_params_to_jax(self, config, key)  # config not needed here
+        # from gflownet.trainers.jax_minimal import (
+        #     convert_params_to_jax,
+        #     apply_params_to_pytorch,
+        #     sync_params_from_pytorch_to_jax,
+        # )
+        # import jax
+        # key = jax.random.PRNGKey(0)
+        # jax_params, jax_policies = convert_params_to_jax(self, config, key)  # config not needed here
     
         # Train loop
         pbar = tqdm(
@@ -956,7 +956,7 @@ class GFlowNetAgent:
                 self.evaluator.eval_and_log_top_k(self.it)
                 
             #! JAX conversion debugging
-            apply_params_to_pytorch(jax_params, self, jax_policies)
+            # apply_params_to_pytorch(jax_params, self, jax_policies)
 
             t0_iter = time.time()
             batch = Batch(
@@ -981,7 +981,6 @@ class GFlowNetAgent:
                 if not all([torch.isfinite(loss) for loss in losses.values()]):
                     if self.logger.debug:
                         print("Loss is not finite - skipping iteration")
-                #! COMMENTED OUT TO DEBUG GRADIENT ISSUE
                 else:
                     losses["all"].backward()
                     if self.clip_grad_norm > 0:
@@ -995,9 +994,9 @@ class GFlowNetAgent:
                     batch.zero_logprobs()
                     
             #! JAX conversion debugging
-            jax_params, jax_policies = sync_params_from_pytorch_to_jax(
-                self, jax_params, jax_policies
-            )
+            # jax_params, jax_policies = sync_params_from_pytorch_to_jax(
+            #     self, jax_params, jax_policies
+            # )
 
             times = self.log_train_iteration(pbar, losses, batch, times)
 
@@ -1337,33 +1336,63 @@ class GFlowNetAgent:
         if self.logger.debug:
             print("\nCheckpoint loaded into GFlowNet agent\n")
 
+#! TO UNCOMMENT AFTER OPTAX DEBUGGING
+# def make_opt(params, logZ, config):
+#     """
+#     Set up the optimizer
+#     """
+#     params = params
+#     if not len(params):
+#         return None
+#     if config.method == "adam":
+#         opt = torch.optim.Adam(
+#             params,
+#             config.lr,
+#             betas=(config.adam_beta1, config.adam_beta2),
+#         )
+#         if logZ is not None:
+#             opt.add_param_group(
+#                 {
+#                     "params": logZ,
+#                     "lr": config.lr * config.lr_z_mult,
+#                 }
+#             )
+#     elif config.method == "msgd":
+#         opt = torch.optim.SGD(params, config.lr, momentum=config.momentum)
+#     # Learning rate scheduling
+#     lr_scheduler = torch.optim.lr_scheduler.StepLR(
+#         opt,
+#         step_size=config.lr_decay_period,
+#         gamma=config.lr_decay_gamma,
+#     )
+#     return opt, lr_scheduler
 
 def make_opt(params, logZ, config):
     """
-    Set up the optimizer
+    Set up the optimizer - HARD-CODED FOR DEBUGGING
     """
     params = params
     if not len(params):
         return None
-    if config.method == "adam":
-        opt = torch.optim.Adam(
-            params,
-            config.lr,
-            betas=(config.adam_beta1, config.adam_beta2),
+    
+    # HARD-CODED VALUES - must match JAX exactly
+    lr_main = 0.0001
+    lr_logz = 0.001
+    
+    opt = torch.optim.SGD(params, lr=lr_main)
+    
+    if logZ is not None:
+        opt.add_param_group(
+            {
+                "params": logZ,
+                "lr": lr_logz,  # Hard-coded 10x
+            }
         )
-        if logZ is not None:
-            opt.add_param_group(
-                {
-                    "params": logZ,
-                    "lr": config.lr * config.lr_z_mult,
-                }
-            )
-    elif config.method == "msgd":
-        opt = torch.optim.SGD(params, config.lr, momentum=config.momentum)
-    # Learning rate scheduling
+    
+    # Dummy scheduler that does nothing
     lr_scheduler = torch.optim.lr_scheduler.StepLR(
         opt,
-        step_size=config.lr_decay_period,
-        gamma=config.lr_decay_gamma,
+        step_size=999999,
+        gamma=1.0,
     )
     return opt, lr_scheduler
