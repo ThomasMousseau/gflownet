@@ -505,6 +505,13 @@ def train(agent, config):
             # jax.debug.print("log_rewards sample: {}", log_rewards[:5])
             
             losses = (logZ + logprob_ratios - log_rewards) ** 2
+            
+            #! DEBUG FOR OPTIMIZER
+            jax.debug.print("JAX iter 1 - logZ: {}", logZ)
+            jax.debug.print("JAX iter 1 - logprob_ratios[0]: {}", logprob_ratios[0])
+            jax.debug.print("JAX iter 1 - log_rewards[0]: {}", log_rewards[0])
+            jax.debug.print("JAX iter 1 - loss: {}", jnp.mean(losses))
+            
             return jnp.mean(losses)
         
         # Fallback
@@ -521,9 +528,7 @@ def train(agent, config):
         loss_value, grads = value_and_grad(jax_loss_wrapper)(
             params, batch_arrays, loss_type=loss_type, n_trajs=n_trajs
         )
-        
-        # jax.debug.print("loss_value before NaN check: {}", loss_value)
-        
+                
         # loss_value = jax_loss_wrapper(params, batch_arrays, loss_type=loss_type, n_trajs=n_trajs, debug=True)
         # grads = grad(lambda p: jax_loss_wrapper(p, batch_arrays, loss_type=loss_type, n_trajs=n_trajs, debug=False))(params)
                 
@@ -533,6 +538,9 @@ def train(agent, config):
         new_params = optax.apply_updates(params, updates)
         # new_opt_state = opt_state
         # new_params = params
+
+        first_layer_grad = grads['forward_policy_trainable'].layers[0].weight
+        jax.debug.print("JAX grad_forward_layer0_norm: {}", jnp.linalg.norm(first_layer_grad))
         
         return new_params, new_opt_state, loss_value, grads
     
@@ -592,10 +600,7 @@ def train(agent, config):
         
         # # Update replay buffer
         # agent.buffer.add(states_term, actions_trajectories, rewards, iteration, buffer="replay")
-        
-        # if iteration <= 5:
-        #     print(f"JAX Iteration {iteration}: logZ sum = {jnp.sum(jax_params['logZ']):.4f}")
-        #     print("grad logZ:", grads.get("logZ", None))
+    
         
         # ========== LOGGING & SIDE EFFECTS (unchanged) ==========
         # Update loss EMA
@@ -676,6 +681,7 @@ def train(agent, config):
                 "Learning rate": lr_main,
                 "Learning rate logZ": lr_logz,
                 "grad_logZ_mean": float(grad_logZ.mean()),
+                "first_layer_grad_norm": float(jnp.linalg.norm(grads['forward_policy_trainable'].layers[0].weight)),
             }
 
             agent.logger.log_metrics(

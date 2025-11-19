@@ -8,6 +8,7 @@ The Trajectory Balance (TB) loss or objective was defined by Malkin et al. (2022
 
 from torchtyping import TensorType
 
+from gflownet import losses
 from gflownet.losses.base import BaseLoss
 from gflownet.utils.batch import Batch, compute_logprobs_trajectories
 
@@ -108,6 +109,16 @@ class TrajectoryBalance(BaseLoss):
         logrewards = batch.get_terminating_rewards(log=True, sort_by="trajectory")
 
         # Trajectory balance loss
+        logprob_ratios = logprobs_f - logprobs_b
+        log_rewards = logrewards
+        losses = (self.logZ.sum() + logprob_ratios - log_rewards).pow(2)
+        
+        #! DEBUG FOR OPTIMIZER
+        print(f"PyTorch iter 1 - logZ: {self.logZ.sum().item():.10f}")
+        print(f"PyTorch iter 1 - logprob_ratios[0]: {logprob_ratios[0].item():.10f}")
+        print(f"PyTorch iter 1 - log_rewards[0]: {log_rewards[0].item():.10f}")
+        print(f"PyTorch iter 1 - loss: {losses.mean().item():.10f}")
+        
         return (self.logZ.sum() + logprobs_f - logprobs_b - logrewards).pow(2)
 
     # TODO: extend with loss over the different types of trajectories (forward, replay

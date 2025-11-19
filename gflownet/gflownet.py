@@ -990,8 +990,11 @@ class GFlowNetAgent:
                     self.grad_logz_mean = self.logZ.grad.mean().item() 
                     self.opt.step()
                     self.lr_scheduler.step()
+                    self.norm_grad_foward_first_layer = torch.norm(self.forward_policy.model[0].weight.grad)
+                    #print(f"PyTorch grad_forward_layer0_norm: {torch.norm(self.forward_policy.model[0].weight.grad):.10f}")
                     self.opt.zero_grad()
                     batch.zero_logprobs()
+                    
                     
             #! JAX conversion debugging
             # jax_params, jax_policies = sync_params_from_pytorch_to_jax(
@@ -1154,7 +1157,8 @@ class GFlowNetAgent:
                     "Learning rate": learning_rates[0],
                     "Learning rate logZ": learning_rates[1],
                     #! COMMENTED OUT TO DEBUG GRADIENT ISSUE
-                    # "grad_logZ_mean": self.grad_logz_mean 
+                    "grad_logZ_mean": self.grad_logz_mean,
+                    "first_layer_grad_norm": self.norm_grad_foward_first_layer,
                 },
                 step=self.it,
                 use_context=self.use_context,
