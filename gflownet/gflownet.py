@@ -950,6 +950,7 @@ class GFlowNetAgent:
         )
         for self.it in range(self.it, self.n_train_steps + 1):
             # Test and log
+            print(f"\n=== Iteration {self.it} ===")
             if self.evaluator.should_eval(self.it):
                 self.evaluator.eval_and_log(self.it)
             if self.evaluator.should_eval_top_k(self.it):
@@ -976,6 +977,13 @@ class GFlowNetAgent:
                 batch.merge(sub_batch)
                 
             for j in range(self.ttsr):
+                
+                #! TO COMMENT AFTER RNG DEBUGGING
+                if self.it == 1:
+                    saved_batch = batch 
+                if self.it <= 10:
+                    batch = saved_batch
+    
                 losses = self.loss.compute(batch, get_sublosses=True)
                 # TODO: deal with this in a better way
                 if not all([torch.isfinite(loss) for loss in losses.values()]):
@@ -991,9 +999,10 @@ class GFlowNetAgent:
                     self.opt.step()
                     self.lr_scheduler.step()
                     self.norm_grad_foward_first_layer = torch.norm(self.forward_policy.model[0].weight.grad)
-                    #print(f"PyTorch grad_forward_layer0_norm: {torch.norm(self.forward_policy.model[0].weight.grad):.10f}")
+                    print(f"PyTorch grad_forward_layer0_norm: {torch.norm(self.forward_policy.model[0].weight.grad):.10f}")
                     self.opt.zero_grad()
-                    batch.zero_logprobs()
+                    # !UNCOMMENT AFTER RNG DEBUGGING
+                    #batch.zero_logprobs()
                     
                     
             #! JAX conversion debugging

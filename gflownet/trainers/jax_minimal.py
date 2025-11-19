@@ -471,17 +471,21 @@ def train(agent, config):
                 model_b = eqx.combine(params['backward_policy_trainable'], jax_policies['backward_static'])
             else:
                 model_b = jax_policies['backward'].model
-                    
-            logits_f = jax.vmap(model_f)(batch_arrays['parents_policy'])
-            logits_f_masked = jnp.where(batch_arrays['masks_forward'], -jnp.inf, logits_f)
-            logprobs_f_all = jax.nn.log_softmax(logits_f_masked, axis=1)
-            logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
+                                
+            # logits_f = jax.vmap(model_f)(batch_arrays['parents_policy'])
+            # logits_f_masked = jnp.where(batch_arrays['masks_forward'], -jnp.inf, logits_f)
+            # logprobs_f_all = jax.nn.log_softmax(logits_f_masked, axis=1)
+            # logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
+
+            # logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
+            # logits_b_masked = jnp.where(batch_arrays['masks_backward'], -jnp.inf, logits_b)
+            # logprobs_b_all = jax.nn.log_softmax(logits_b_masked, axis=1)
+            # logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
             
-            logits_b = jax.vmap(model_b)(batch_arrays['states_policy'])
-            logits_b_masked = jnp.where(batch_arrays['masks_backward'], -jnp.inf, logits_b)
-            logprobs_b_all = jax.nn.log_softmax(logits_b_masked, axis=1)
-            logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
-            
+            #! TO COMMENT OUT FOR DEBUGGING
+            logprobs_f = batch_arrays['logprobs']       # Collected during sampling
+            logprobs_b = batch_arrays['logprobs_rev']
+        
             # Get logZ
             logZ = params.get('logZ', jnp.array(0.0))
             if logZ is not None and logZ.ndim > 0:
@@ -489,28 +493,40 @@ def train(agent, config):
             
             traj_indices = batch_arrays['trajectory_indices']
             
-            def compute_traj_logprob_ratio(traj_idx):
-                mask = (traj_indices == traj_idx).astype(jnp.float32)
-                #TODO: LET'S MINE!
-                log_pF = jnp.sum(logprobs_f * mask)
-                log_pB = jnp.sum(logprobs_b * mask)
-                return log_pF - log_pB
+            # def compute_traj_logprob_ratio(traj_idx):
+            #     mask = (traj_indices == traj_idx).astype(jnp.float32)
+            #     #TODO: LET'S MINE!
+            #     log_pF = jnp.sum(logprobs_f * mask)
+            #     log_pB = jnp.sum(logprobs_b * mask)
+            #     return log_pF - log_pB
+            # logprob_ratios = jax.vmap(compute_traj_logprob_ratio)(jnp.arange(n_trajs))
+            # logprob_ratios = jnp.array([compute_traj_logprob_ratio(tidx) for tidx in jnp.arange(n_trajs)])
             
-            #logprob_ratios = jax.vmap(compute_traj_logprob_ratio)(jnp.arange(n_trajs))
-            logprob_ratios = jnp.array([compute_traj_logprob_ratio(tidx) for tidx in jnp.arange(n_trajs)])
+            traj_one_hot = jax.nn.one_hot(traj_indices, n_trajs, dtype=jnp.float32)  # shape: (batch_size, n_trajs)
+            log_pF_per_traj = jnp.sum(logprobs_f[:, None] * traj_one_hot, axis=0)  # shape: (n_trajs,)
+            log_pB_per_traj = jnp.sum(logprobs_b[:, None] * traj_one_hot, axis=0)  # shape: (n_trajs,)
+
+            logprob_ratios = log_pF_per_traj - log_pB_per_traj
+            
+            jax.debug.print("Using vmap (not list comp): logprob_ratios shape: {}", logprob_ratios.shape)
             log_rewards = batch_arrays['logrewards']
-            
-            # jax.debug.print("logZ: {}", logZ)
-            # jax.debug.print("logprob_ratios sample: {}", logprob_ratios[:5])
-            # jax.debug.print("log_rewards sample: {}", log_rewards[:5])
             
             losses = (logZ + logprob_ratios - log_rewards) ** 2
             
-            #! DEBUG FOR OPTIMIZER
-            jax.debug.print("JAX iter 1 - logZ: {}", logZ)
-            jax.debug.print("JAX iter 1 - logprob_ratios[0]: {}", logprob_ratios[0])
-            jax.debug.print("JAX iter 1 - log_rewards[0]: {}", log_rewards[0])
-            jax.debug.print("JAX iter 1 - loss: {}", jnp.mean(losses))
+            jax.debug.print("=== JAX LOSS COMPONENTS ===")
+            jax.debug.print("logZ: {}", logZ)
+            jax.debug.print("logprob_ratios (first 3): {}", logprob_ratios[:3])
+            jax.debug.print("log_rewards (first 3): {}", log_rewards[:3])
+            jax.debug.print("logprob_ratios - log_rewards (first 3): {}", (logprob_ratios - log_rewards)[:3])
+            jax.debug.print("logZ + logprob_ratios - log_rewards (first 3): {}", (logZ + logprob_ratios - log_rewards)[:3])
+
+            # Individual logprobs
+            jax.debug.print("logprobs_f (first 5): {}", logprobs_f[:5])
+            jax.debug.print("logprobs_b (first 5): {}", logprobs_b[:5])
+
+            # Trajectory grouping
+            jax.debug.print("n_trajs: {}", n_trajs)
+            jax.debug.print("traj_indices (first 10): {}", traj_indices[:10])
             
             return jnp.mean(losses)
         
@@ -553,6 +569,8 @@ def train(agent, config):
     
     for iteration in range(agent.it, agent.n_train_steps + 1):
         
+        jax.debug.print("=== TRAINING ITERATION {} ===", iteration)
+        
         batch = Batch(
             env=agent.env,
             proxy=agent.proxy,
@@ -574,7 +592,13 @@ def train(agent, config):
         # Convert batch to JAX arrays
         batch_arrays = convert_batch_to_jax_arrays(batch)
         
-        n_trajs = batch_arrays.pop('n_trajs') 
+        #! TO COMMENT AFTER RNG DEBUGGING
+        if iteration == 1:
+            saved_batch_arrays = batch_arrays.copy()
+        if iteration <= 10:
+            batch_arrays = saved_batch_arrays
+        
+        n_trajs = batch_arrays.get('n_trajs') 
         
         # ========== JAX: Training Steps ==========
         # Perform multiple gradient steps (train-to-sample ratio)
