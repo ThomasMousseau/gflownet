@@ -991,10 +991,10 @@ class GFlowNetAgent:
                         print("Loss is not finite - skipping iteration")
                 else:
                     losses["all"].backward()
-                    if self.clip_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.parameters(), self.clip_grad_norm
-                        )
+                    # if self.clip_grad_norm > 0:
+                    #     torch.nn.utils.clip_grad_norm_(
+                    #         self.parameters(), self.clip_grad_norm
+                    #     )
                     self.grad_logz_mean = self.logZ.grad.mean().item() 
                     self.opt.step()
                     self.lr_scheduler.step()
@@ -1350,62 +1350,67 @@ class GFlowNetAgent:
             print("\nCheckpoint loaded into GFlowNet agent\n")
 
 #! TO UNCOMMENT AFTER OPTAX DEBUGGING
+# def make_opt(params, logZ, config):
+#     """
+#     Set up the optimizer
+#     """
+#     params = params
+#     if not len(params):
+#         return None
+#     if config.method == "adam":
+#         opt = torch.optim.Adam(
+#             params,
+#             config.lr,
+#             betas=(config.adam_beta1, config.adam_beta2),
+#         )
+#         if logZ is not None:
+#             opt.add_param_group(
+#                 {
+#                     "params": logZ,
+#                     "lr": config.lr * config.lr_z_mult,
+#                 }
+#             )
+#     elif config.method == "msgd":
+#         opt = torch.optim.SGD(params, config.lr, momentum=config.momentum)
+#     # Learning rate scheduling
+#     lr_scheduler = torch.optim.lr_scheduler.StepLR(
+#         opt,
+#         step_size=config.lr_decay_period,
+#         gamma=config.lr_decay_gamma,
+#     )
+#     return opt, lr_scheduler
+
 def make_opt(params, logZ, config):
     """
-    Set up the optimizer
+    Set up the optimizer — SAME STRUCTURE as your debug version,
+    but using the REAL scheduler and correct LRs that match JAX.
     """
     params = params
     if not len(params):
         return None
-    if config.method == "adam":
-        opt = torch.optim.Adam(
-            params,
-            config.lr,
-            betas=(config.adam_beta1, config.adam_beta2),
+    
+    # === Learning rates that EXACTLY match JAX/Optax ===
+    lr_main = config.lr * 0.01
+    lr_logz = config.lr * config.lr_z_mult * 0.01
+
+    # === Use SGD for debugging (matching your JAX SGD run) ===
+    opt = torch.optim.SGD(params, lr=lr_main, momentum=0.9)
+
+    # Add logZ param group with correct LR
+    if logZ is not None:
+        opt.add_param_group(
+            {
+                "params": logZ,
+                "lr": lr_logz,
+            }
         )
-        if logZ is not None:
-            opt.add_param_group(
-                {
-                    "params": logZ,
-                    "lr": config.lr * config.lr_z_mult,
-                }
-            )
-    elif config.method == "msgd":
-        opt = torch.optim.SGD(params, config.lr, momentum=config.momentum)
-    # Learning rate scheduling
+
+    # === StepLR that exactly matches Optax exponential_decay(staircase=True) ===
     lr_scheduler = torch.optim.lr_scheduler.StepLR(
         opt,
         step_size=config.lr_decay_period,
         gamma=config.lr_decay_gamma,
     )
+
     return opt, lr_scheduler
 
-# def make_opt(params, logZ, config):
-#     """
-#     Set up the optimizer - HARD-CODED FOR DEBUGGING
-#     """
-#     params = params
-#     if not len(params):
-#         return None
-    
-#     # HARD-CODED VALUES - must match JAX exactly
-#     lr_main = 0.0001
-#     lr_logz = 0.001
-    
-#     opt = torch.optim.SGD(params, lr=lr_main)
-    
-#     if logZ is not None:
-#         opt.add_param_group(
-#             {
-#                 "params": logZ,
-#                 "lr": lr_logz,  # Hard-coded 10x
-#             }
-#         )
-    
-#     # Dummy scheduler that does nothing
-#     lr_scheduler = torch.optim.lr_scheduler.StepLR(
-#         opt,
-#         step_size=999999,
-#         gamma=1.0,
-#     )
-#     return opt, lr_scheduler
