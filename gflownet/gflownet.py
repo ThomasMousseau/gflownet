@@ -1390,8 +1390,8 @@ def make_opt(params, logZ, config):
         return None
     
     # === Learning rates that EXACTLY match JAX/Optax ===
-    lr_main = config.lr * 0.01
-    lr_logz = config.lr * config.lr_z_mult * 0.01
+    lr_main = config.lr
+    lr_logz = config.lr * config.lr_z_mult
 
     # === Use SGD for debugging (matching your JAX SGD run) ===
     opt = torch.optim.SGD(params, lr=lr_main, momentum=0.9)

@@ -2,11 +2,11 @@
 # A configuration that works well with a 10x10 Grid environment and the corners proxy.
 
 defaults:
-   - override /env: grid
-   - override /gflownet: trajectorybalance
-   - override /loss: trajectorybalance
-   - override /proxy: box/corners
-   - override /logger: wandb
+  - override /env: grid
+  - override /gflownet: trajectorybalance
+  - override /loss: trajectorybalance
+  - override /proxy: box/corners
+  - override /logger: wandb
 
 # Environment
 env:
@@ -43,11 +43,11 @@ policy:
 # WandB
 logger:
   do:
-    online: False
+    online: True
   lightweight: True
   project_name: "grid"
   run_name: "20x20"
-  tags: 
+  tags:
     - gflownet
     - grid
     - corners
@@ -58,7 +58,6 @@ evaluator:
   period: 500
   n: 1000
   checkpoints_period: 500
-
 
 # Hydra
 hydra:

@@ -371,55 +371,38 @@ def train(agent, config):
     """
     # !Setup Optax optimizer with separate LR for logZ
     lr_schedule_main = optax.exponential_decay(
-        init_value=config.gflownet.optimizer.lr * 0.01,
+        init_value=config.gflownet.optimizer.lr,
         transition_steps=config.gflownet.optimizer.lr_decay_period,
         decay_rate=config.gflownet.optimizer.lr_decay_gamma,
         staircase=True  # ← Makes it step-wise like PyTorch StepLR
     )
 
     lr_schedule_logz = optax.exponential_decay(
-        init_value=config.gflownet.optimizer.lr * config.gflownet.optimizer.lr_z_mult * 0.01,
+        init_value=config.gflownet.optimizer.lr * config.gflownet.optimizer.lr_z_mult,
         transition_steps=config.gflownet.optimizer.lr_decay_period,
         decay_rate=config.gflownet.optimizer.lr_decay_gamma,
         staircase=True
     )
     
-    # max_grad_norm = 0.0001
+    max_grad_norm = 1.0  # Hard-coded, matching PyTorch
 
-    # optimizer = optax.multi_transform(
-    #     {
-    #         'main': optax.chain(
-    #             # optax.clip_by_global_norm(max_grad_norm), 
-    #             optax.adam(
-    #                 learning_rate=lr_schedule_main,
-    #                 b1=config.gflownet.optimizer.adam_beta1,
-    #                 b2=config.gflownet.optimizer.adam_beta2,
-    #                 eps=1e-8,
-    #                 eps_root=0.0,
-    #             ),
-    #         ),
-    #         'logz': optax.adam(
-    #             learning_rate=lr_schedule_logz,
-    #             b1=config.gflownet.optimizer.adam_beta1,
-    #             b2=config.gflownet.optimizer.adam_beta2,
-    #             eps=1e-8, # like in torch.optim.Adam
-    #             eps_root=0.0,
-    #         ),
-    #     },
-    #     {
-    #         'forward_policy_trainable': 'main',
-    #         'backward_policy_trainable': 'main',
-    #         'logZ': 'logz'
-    #     }
-    # )
-    
-    #lr_schedule_main = 0.0001  # Hard-coded, matching PyTorch
-    #lr_schedule_logz = 0.001   # Hard-coded, 10x for logZ (matching PyTorch)
-    
     optimizer = optax.multi_transform(
         {
-            'main': optax.sgd(learning_rate=lr_schedule_main, momentum=0.9),  # Simple SGD, no momentum
-            'logz': optax.sgd(learning_rate=lr_schedule_logz, momentum=0.9),    # Simple SGD, no momentum
+            'main': optax.chain(
+                optax.clip_by_global_norm(max_grad_norm), 
+                optax.adam(
+                    learning_rate=lr_schedule_main,
+                    b1=config.gflownet.optimizer.adam_beta1,
+                    b2=config.gflownet.optimizer.adam_beta2,
+                    eps=1e-8
+                ),
+            ),
+            'logz': optax.adam(
+                learning_rate=lr_schedule_logz,
+                b1=config.gflownet.optimizer.adam_beta1,
+                b2=config.gflownet.optimizer.adam_beta2,
+                eps=1e-8, # like in torch.optim.Adam
+            ),
         },
         {
             'forward_policy_trainable': 'main',
@@ -427,6 +410,21 @@ def train(agent, config):
             'logZ': 'logz'
         }
     )
+    
+    #lr_schedule_main = 0.0001  # Hard-coded, matching PyTorch
+    #lr_schedule_logz = 0.001   # Hard-coded, 10x for logZ (matching PyTorch)
+    
+    # optimizer = optax.multi_transform(
+    #     {
+    #         'main': optax.sgd(learning_rate=lr_schedule_main, momentum=0.9),  # Simple SGD, no momentum
+    #         'logz': optax.sgd(learning_rate=lr_schedule_logz, momentum=0.9),    # Simple SGD, no momentum
+    #     },
+    #     {
+    #         'forward_policy_trainable': 'main',
+    #         'backward_policy_trainable': 'main',
+    #         'logZ': 'logz'
+    #     }
+    # )
     
     key = jax.random.PRNGKey(config.seed)
     jax_params, jax_policies = convert_params_to_jax(agent, config, key)
@@ -829,3 +827,30 @@ def sync_params_from_pytorch_to_jax(agent, jax_params, jax_policies):
         jax_policies["backward_static"] = static_b
     
     return jax_params, jax_policies
+
+# def torch_style_adam(lr, b1=0.9, b2=0.999, eps=1e-8):
+#     def init_fn(params):
+#         m = jax.tree.map(jnp.zeros_like, params)
+#         v = jax.tree.map(jnp.zeros_like, params)
+#         t = jnp.array(0, dtype=jnp.int32)
+#         return (m, v, t)
+
+#     def update_fn(grads, state, params=None):
+#         m, v, t = state
+#         t = t + 1
+
+#         m = jax.tree.map(lambda m, g: b1 * m + (1 - b1) * g, m, grads)
+#         v = jax.tree.map(lambda v, g: b2 * v + (1 - b2) * (g * g), v, grads)
+
+#         bc1 = 1 - b1 ** t
+#         bc2 = 1 - b2 ** t
+
+#         def adam_update(m, v):
+#             m_hat = m / bc1
+#             v_hat = v / bc2
+#             return -lr * m_hat / (jnp.sqrt(v_hat) + eps)
+
+#         updates = jax.tree.map(adam_update, m, v)
+#         return updates, (m, v, t)
+
+#     return optax.GradientTransformation(init_fn, update_fn)
