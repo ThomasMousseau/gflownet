@@ -297,6 +297,9 @@ def apply_params_to_pytorch(jax_params, agent, jax_policies):
     Assumes forward and backward policies both have a flat MLP:
     [Linear, Act, Linear, Act, Linear].
     """
+    # Track updated layers to avoid overwriting shared weights
+    updated_modules = set()
+    
     try:
         # ---------- FORWARD POLICY ----------
         if (
@@ -316,13 +319,26 @@ def apply_params_to_pytorch(jax_params, agent, jax_policies):
             ]
 
             for pt_lin, jax_lin in forward_pairs:
+                if id(pt_lin) in updated_modules:
+                    continue
+                
                 w_np = np.asarray(jax_lin.weight, dtype=np.float32)
+                # Make writable to avoid warning
+                w_np = np.copy(w_np)
+                
                 w_t = torch.from_numpy(w_np).to(pt_lin.weight.device, pt_lin.weight.dtype)
-                pt_lin.weight.data.copy_(w_t)
-
+                with torch.no_grad():
+                    pt_lin.weight.copy_(w_t)
+                
                 b_np = np.asarray(jax_lin.bias, dtype=np.float32)
+                b_np = np.copy(b_np)
+                
                 b_t = torch.from_numpy(b_np).to(pt_lin.bias.device, pt_lin.bias.dtype)
-                pt_lin.bias.data.copy_(b_t)
+                with torch.no_grad():
+                    pt_lin.bias.copy_(b_t)
+                
+                updated_modules.add(id(pt_lin))
+
 
         # ---------- BACKWARD POLICY ----------
         if (
@@ -342,13 +358,22 @@ def apply_params_to_pytorch(jax_params, agent, jax_policies):
             ]
 
             for pt_lin, jax_lin in backward_pairs:
+                if id(pt_lin) in updated_modules:
+                    continue
+                
                 w_np = np.asarray(jax_lin.weight, dtype=np.float32)
+                w_np = np.copy(w_np)
                 w_t = torch.from_numpy(w_np).to(pt_lin.weight.device, pt_lin.weight.dtype)
-                pt_lin.weight.data.copy_(w_t)
+                with torch.no_grad():
+                    pt_lin.weight.copy_(w_t)
 
                 b_np = np.asarray(jax_lin.bias, dtype=np.float32)
+                b_np = np.copy(b_np)
                 b_t = torch.from_numpy(b_np).to(pt_lin.bias.device, pt_lin.bias.dtype)
-                pt_lin.bias.data.copy_(b_t)
+                with torch.no_grad():
+                    pt_lin.bias.copy_(b_t)
+                
+                updated_modules.add(id(pt_lin))
 
         # ---------- logZ ----------
         if jax_params.get("logZ", None) is not None and agent.logZ is not None:

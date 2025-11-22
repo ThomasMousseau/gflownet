@@ -11,21 +11,21 @@ defaults:
 # Environment
 env:
   n_dim: 2
-  length: 20
+  length: 20 #! make it 4 for debugging
   max_increment: 1
   max_dim_per_action: 1
 
-# Buffer
+# Buffer #! Buffer Alex
 buffer:
   test:
     type: all
 
 # GFlowNet hyperparameters
 gflownet:
-  random_action_prob: 0.1
+  random_action_prob: 0.1 #! 0.0
   optimizer:
     batch_size:
-      forward: 100
+      forward: 100 #! make it 1 for debugging
     lr: 0.0001
     z_dim: 16
     lr_z_mult: 100
