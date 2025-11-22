@@ -109,6 +109,25 @@ def convert_batch_to_jax_arrays(pytorch_batch: Batch):
     }
 
 
+def _match_linear_layers(pt_model, jax_model, context):
+    """
+    Return PyTorch Linear modules and matching JAX Linear layers (with indices).
+    Raises if the number of Linear layers does not match.
+    """
+    pt_linears = [layer for layer in pt_model if isinstance(layer, nn.Linear)]
+    jax_linears = [
+        (idx, layer)
+        for idx, layer in enumerate(jax_model.layers)
+        if isinstance(layer, eqx.nn.Linear)
+    ]
+    if len(pt_linears) != len(jax_linears):
+        raise ValueError(
+            f"{context}: mismatch in Linear layer count between PyTorch "
+            f"({len(pt_linears)}) and JAX ({len(jax_linears)}). Ensure MLP configs align."
+        )
+    return pt_linears, jax_linears
+
+
 def convert_params_to_jax(agent, config, key):
 
     if isinstance(agent.float, torch.dtype):
@@ -148,38 +167,21 @@ def convert_params_to_jax(agent, config, key):
             pt_model_f = agent.forward_policy.model          # nn.Sequential
             jax_model_f = jax_policy_f.model                # Equinox Sequential
 
-            jax_model_f = eqx.tree_at(
-                lambda m: m.layers[0].weight,
-                jax_model_f,
-                jnp.array(pt_model_f[0].weight.detach().cpu().numpy(), dtype=jnp.float32),
-            )
-            jax_model_f = eqx.tree_at(
-                lambda m: m.layers[0].bias,
-                jax_model_f,
-                jnp.array(pt_model_f[0].bias.detach().cpu().numpy(), dtype=jnp.float32),
+            pt_linears_f, jax_linears_f = _match_linear_layers(
+                pt_model_f, jax_model_f, "Forward policy"
             )
 
-            jax_model_f = eqx.tree_at(
-                lambda m: m.layers[2].weight,
-                jax_model_f,
-                jnp.array(pt_model_f[2].weight.detach().cpu().numpy(), dtype=jnp.float32),
-            )
-            jax_model_f = eqx.tree_at(
-                lambda m: m.layers[2].bias,
-                jax_model_f,
-                jnp.array(pt_model_f[2].bias.detach().cpu().numpy(), dtype=jnp.float32),
-            )
-
-            jax_model_f = eqx.tree_at(
-                lambda m: m.layers[4].weight,
-                jax_model_f,
-                jnp.array(pt_model_f[4].weight.detach().cpu().numpy(), dtype=jnp.float32),
-            )
-            jax_model_f = eqx.tree_at(
-                lambda m: m.layers[4].bias,
-                jax_model_f,
-                jnp.array(pt_model_f[4].bias.detach().cpu().numpy(), dtype=jnp.float32),
-            )
+            for pt_lin, (jax_idx, _) in zip(pt_linears_f, jax_linears_f):
+                jax_model_f = eqx.tree_at(
+                    lambda m, idx=jax_idx: m.layers[idx].weight,
+                    jax_model_f,
+                    jnp.array(pt_lin.weight.detach().cpu().numpy(), dtype=jnp.float32),
+                )
+                jax_model_f = eqx.tree_at(
+                    lambda m, idx=jax_idx: m.layers[idx].bias,
+                    jax_model_f,
+                    jnp.array(pt_lin.bias.detach().cpu().numpy(), dtype=jnp.float32),
+                )
 
             jax_policy_f.model = jax_model_f
 
@@ -226,38 +228,21 @@ def convert_params_to_jax(agent, config, key):
             pt_model_b = agent.backward_policy.model        # now flat nn.Sequential
             jax_model_b = jax_policy_b.model                # Equinox Sequential
 
-            jax_model_b = eqx.tree_at(
-                lambda m: m.layers[0].weight,
-                jax_model_b,
-                jnp.array(pt_model_b[0].weight.detach().cpu().numpy(), dtype=jnp.float32),
-            )
-            jax_model_b = eqx.tree_at(
-                lambda m: m.layers[0].bias,
-                jax_model_b,
-                jnp.array(pt_model_b[0].bias.detach().cpu().numpy(), dtype=jnp.float32),
+            pt_linears_b, jax_linears_b = _match_linear_layers(
+                pt_model_b, jax_model_b, "Backward policy"
             )
 
-            jax_model_b = eqx.tree_at(
-                lambda m: m.layers[2].weight,
-                jax_model_b,
-                jnp.array(pt_model_b[2].weight.detach().cpu().numpy(), dtype=jnp.float32),
-            )
-            jax_model_b = eqx.tree_at(
-                lambda m: m.layers[2].bias,
-                jax_model_b,
-                jnp.array(pt_model_b[2].bias.detach().cpu().numpy(), dtype=jnp.float32),
-            )
-
-            jax_model_b = eqx.tree_at(
-                lambda m: m.layers[4].weight,
-                jax_model_b,
-                jnp.array(pt_model_b[4].weight.detach().cpu().numpy(), dtype=jnp.float32),
-            )
-            jax_model_b = eqx.tree_at(
-                lambda m: m.layers[4].bias,
-                jax_model_b,
-                jnp.array(pt_model_b[4].bias.detach().cpu().numpy(), dtype=jnp.float32),
-            )
+            for pt_lin, (jax_idx, _) in zip(pt_linears_b, jax_linears_b):
+                jax_model_b = eqx.tree_at(
+                    lambda m, idx=jax_idx: m.layers[idx].weight,
+                    jax_model_b,
+                    jnp.array(pt_lin.weight.detach().cpu().numpy(), dtype=jnp.float32),
+                )
+                jax_model_b = eqx.tree_at(
+                    lambda m, idx=jax_idx: m.layers[idx].bias,
+                    jax_model_b,
+                    jnp.array(pt_lin.bias.detach().cpu().numpy(), dtype=jnp.float32),
+                )
 
             jax_policy_b.model = jax_model_b
 
@@ -282,12 +267,35 @@ def convert_params_to_jax(agent, config, key):
 def apply_params_to_pytorch(jax_params, agent, jax_policies):
     """
     Copy JAX parameters back to PyTorch models.
-    Assumes forward and backward policies both have a flat MLP:
-    [Linear, Act, Linear, Act, Linear].
+    Works with arbitrary-depth MLPs (Linear + activation repeats).
     """
     # Track updated layers to avoid overwriting shared weights
     updated_modules = set()
     
+    def _copy_model(pt_model, jax_model, context):
+        pt_linears, jax_linears = _match_linear_layers(pt_model, jax_model, context)
+
+        for pt_lin, (_, jax_lin) in zip(pt_linears, jax_linears):
+            if id(pt_lin) in updated_modules:
+                continue
+
+            w_np = np.asarray(jax_lin.weight, dtype=np.float32)
+            # Make writable to avoid warning
+            w_np = np.copy(w_np)
+            
+            w_t = torch.from_numpy(w_np).to(pt_lin.weight.device, pt_lin.weight.dtype)
+            with torch.no_grad():
+                pt_lin.weight.copy_(w_t)
+
+            b_np = np.asarray(jax_lin.bias, dtype=np.float32)
+            b_np = np.copy(b_np)
+            
+            b_t = torch.from_numpy(b_np).to(pt_lin.bias.device, pt_lin.bias.dtype)
+            with torch.no_grad():
+                pt_lin.bias.copy_(b_t)
+            
+            updated_modules.add(id(pt_lin))
+
     try:
         # ---------- FORWARD POLICY ----------
         if (
@@ -299,34 +307,7 @@ def apply_params_to_pytorch(jax_params, agent, jax_policies):
                 jax_policies["forward_static"],
             )
             pt_model_f = agent.forward_policy.model  # nn.Sequential
-
-            forward_pairs = [
-                (pt_model_f[0], jax_model_f.layers[0]),
-                (pt_model_f[2], jax_model_f.layers[2]),
-                (pt_model_f[4], jax_model_f.layers[4]),
-            ]
-
-            for pt_lin, jax_lin in forward_pairs:
-                if id(pt_lin) in updated_modules:
-                    continue
-                
-                w_np = np.asarray(jax_lin.weight, dtype=np.float32)
-                # Make writable to avoid warning
-                w_np = np.copy(w_np)
-                
-                w_t = torch.from_numpy(w_np).to(pt_lin.weight.device, pt_lin.weight.dtype)
-                with torch.no_grad():
-                    pt_lin.weight.copy_(w_t)
-                
-                b_np = np.asarray(jax_lin.bias, dtype=np.float32)
-                b_np = np.copy(b_np)
-                
-                b_t = torch.from_numpy(b_np).to(pt_lin.bias.device, pt_lin.bias.dtype)
-                with torch.no_grad():
-                    pt_lin.bias.copy_(b_t)
-                
-                updated_modules.add(id(pt_lin))
-
+            _copy_model(pt_model_f, jax_model_f, "Forward policy")
 
         # ---------- BACKWARD POLICY ----------
         if (
@@ -339,29 +320,7 @@ def apply_params_to_pytorch(jax_params, agent, jax_policies):
             )
             pt_model_b = agent.backward_policy.model  # nn.Sequential (flat now!)
 
-            backward_pairs = [
-                (pt_model_b[0], jax_model_b.layers[0]),
-                (pt_model_b[2], jax_model_b.layers[2]),
-                (pt_model_b[4], jax_model_b.layers[4]),
-            ]
-
-            for pt_lin, jax_lin in backward_pairs:
-                if id(pt_lin) in updated_modules:
-                    continue
-                
-                w_np = np.asarray(jax_lin.weight, dtype=np.float32)
-                w_np = np.copy(w_np)
-                w_t = torch.from_numpy(w_np).to(pt_lin.weight.device, pt_lin.weight.dtype)
-                with torch.no_grad():
-                    pt_lin.weight.copy_(w_t)
-
-                b_np = np.asarray(jax_lin.bias, dtype=np.float32)
-                b_np = np.copy(b_np)
-                b_t = torch.from_numpy(b_np).to(pt_lin.bias.device, pt_lin.bias.dtype)
-                with torch.no_grad():
-                    pt_lin.bias.copy_(b_t)
-                
-                updated_modules.add(id(pt_lin))
+            _copy_model(pt_model_b, jax_model_b, "Backward policy")
 
         # ---------- logZ ----------
         if jax_params.get("logZ", None) is not None and agent.logZ is not None:
