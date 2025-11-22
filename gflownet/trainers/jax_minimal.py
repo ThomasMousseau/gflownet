@@ -1,3 +1,4 @@
+import time
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -8,6 +9,9 @@ import torch
 import optax
 from functools import partial
 from tqdm import tqdm
+from torch.utils.dlpack import to_dlpack as torch_to_dlpack
+from torch.utils.dlpack import from_dlpack as torch_from_dlpack
+from jax.dlpack import from_dlpack as jax_from_dlpack
 
 from gflownet.utils.common import instantiate, set_device
 from gflownet.utils.batch import Batch
@@ -18,107 +22,140 @@ from gflownet.utils.policy import parse_policy_config
 # PHASE 1: Minimal JAX - Only JIT the gradient step
 # ============================================================================
 
-    
+def t2j(tensor):
+    """Convert PyTorch tensor to JAX array via DLPack (zero-copy if possible)."""
+    if isinstance(tensor, torch.Tensor):
+        return jax_from_dlpack(tensor.detach().contiguous())
+    return jnp.array(tensor)
 
-def pad_to_fixed_size(arr: jnp.ndarray, size: int, fill_value:int = 0, dtype: jnp.dtype = None) -> jnp.ndarray:
-    if dtype is None:
-        dtype = arr.dtype
-    
-    curr_size = arr.shape[0]
-    if curr_size > size:
-        return jnp.array(arr[:size], dtype=dtype)
-    
-    if curr_size == size:
-        return jnp.array(arr, dtype=dtype)
-        
-    # Pad dimension ONLY 0th
-    pad_width = [(0, size - curr_size)] + [(0, 0)] * (arr.ndim - 1)
-    return jnp.pad(jnp.array(arr, dtype=dtype), pad_width, constant_values=fill_value)
+def j2t(array):
+    """Convert JAX array to PyTorch tensor via DLPack (zero-copy if possible)."""
+    return torch_from_dlpack(array)
 
-def convert_batch_to_jax_arrays(pytorch_batch: Batch, max_states: int, max_trajs: int):
-    """
-    Extract JAX-compatible arrays from PyTorch Batch.
-    This is the bridge between PyTorch sampling and JAX training.
-    """
-    
-    traj_indices = pytorch_batch.get_trajectory_indices(consecutive=True)
-    traj_indices_np = traj_indices.detach().cpu().numpy()
-    
-    actual_n_trajs = int(np.max(traj_indices_np)) + 1
-    actual_n_states = len(pytorch_batch)
-    
-    # Get states for policy input
-    states_policy = pytorch_batch.get_states(policy=True)
-    if isinstance(states_policy, torch.Tensor):
-        states = jnp.array(states_policy.detach().cpu().numpy(), dtype=jnp.float32)
-    else:
-        states = jnp.array([s.detach().cpu().numpy() if isinstance(s, torch.Tensor) else s 
-                           for s in states_policy], dtype=jnp.float32)
-    actions = []
-    for i in range(len(pytorch_batch)):
-        action = pytorch_batch.actions[i]
-        traj_idx = pytorch_batch.traj_indices[i]
-        env = pytorch_batch.envs[traj_idx]
+class JAXBatchConverter:
+    def __init__(self, max_states, max_trajs, device):
+        self.max_states = max_states
+        self.max_trajs = max_trajs
+        self.device = device
+        self.buffers = {}
+
+    def pad_and_convert(self, tensor, size, fill_value=0, name=""):
+        curr_size = tensor.shape[0]
+        if curr_size == size:
+            return t2j(tensor)
         
-        if isinstance(action, tuple):
-            action_idx = env.action2index(action) # Convert (0,0) -> 0
+        if curr_size > size:
+            return t2j(tensor[:size])
+
+        key = name
+        if key not in self.buffers:
+            shape = list(tensor.shape)
+            shape[0] = size
+            self.buffers[key] = torch.full(shape, fill_value, dtype=tensor.dtype, device=self.device)
+        
+        buf = self.buffers[key]
+        
+        # Reallocate if shape mismatch (e.g. embedding dim changed? unlikely)
+        if buf.shape[1:] != tensor.shape[1:] or buf.dtype != tensor.dtype:
+             shape = list(tensor.shape)
+             shape[0] = size
+             buf = torch.full(shape, fill_value, dtype=tensor.dtype, device=self.device)
+             self.buffers[key] = buf
         else:
-            action_idx = action
-        
-        actions.append(action_idx)
-    
-    actions = jnp.array(actions, dtype=jnp.int32)
-    
-    if pytorch_batch.proxy is None:
-        print("WARNING: Batch has no proxy, using zero rewards")
-        terminating_rewards = jnp.zeros(pytorch_batch.get_n_trajectories(), dtype=jnp.float32)
-    else:
-        terminating_rewards_tensor = pytorch_batch.get_terminating_rewards(sort_by="trajectory")
-        terminating_rewards = jnp.array(terminating_rewards_tensor.detach().cpu().numpy(), dtype=jnp.float32)
-    
-    rewards_tensor = pytorch_batch.get_rewards()
-    rewards = jnp.array(rewards_tensor.detach().cpu().numpy(), dtype=jnp.float32)
-    
-    logrewards_tensor = pytorch_batch.get_terminating_rewards(log=True, sort_by="trajectory")
-    logrewards = jnp.array(logrewards_tensor.detach().cpu().numpy(), dtype=jnp.float32)
-    
-    logprobs_fwd, _ = pytorch_batch.get_logprobs(backward=False)
-    logprobs_bwd, _ = pytorch_batch.get_logprobs(backward=True)
-    logprobs = jnp.array(logprobs_fwd.detach().cpu().numpy(), dtype=jnp.float32)
-    logprobs_rev = jnp.array(logprobs_bwd.detach().cpu().numpy(), dtype=jnp.float32)
-    
-    parents_policy = pytorch_batch.get_parents(policy=True)
-    if isinstance(parents_policy, torch.Tensor):
-        parents_policy = jnp.array(parents_policy.detach().cpu().numpy(), dtype=jnp.float32)
-    else:
-        parents_policy = jnp.array([p.detach().cpu().numpy() if isinstance(p, torch.Tensor) else p for p in parents_policy], dtype=jnp.float32)
+             buf.fill_(fill_value)
 
-    masks_forward_pt = pytorch_batch.get_masks_forward(of_parents=True)
-    masks_backward_pt = pytorch_batch.get_masks_backward()
-    
-    masks_forward = jnp.array(masks_forward_pt.detach().cpu().numpy())
-    masks_backward = jnp.array(masks_backward_pt.detach().cpu().numpy())
-    
-    return {
-        'states': pad_to_fixed_size(states, max_states, dtype=jnp.float32),
-        'parents_policy': pad_to_fixed_size(parents_policy, max_states, dtype=jnp.float32),
-        'actions': pad_to_fixed_size(actions, max_states, dtype=jnp.int32),
-        'rewards': pad_to_fixed_size(rewards, max_states, dtype=jnp.float32),
-        'logprobs': pad_to_fixed_size(logprobs, max_states, dtype=jnp.float32),
-        'logprobs_rev': pad_to_fixed_size(logprobs_rev, max_states, dtype=jnp.float32),
-        'trajectory_indices': pad_to_fixed_size(traj_indices_np, max_states, fill_value=-1, dtype=jnp.int32),
-        'masks_forward': pad_to_fixed_size(masks_forward, max_states, fill_value=1, dtype=jnp.bool_), # 1=masked
-        'masks_backward': pad_to_fixed_size(masks_backward, max_states, fill_value=1, dtype=jnp.bool_),
+        buf[:curr_size] = tensor
+        return t2j(buf)
+
+    def __call__(self, pytorch_batch: Batch):
+        """
+        Extract JAX-compatible arrays from PyTorch Batch using pre-allocated buffers.
+        """
         
-        'terminating_rewards': pad_to_fixed_size(terminating_rewards, max_trajs, dtype=jnp.float32),
-        'logrewards': pad_to_fixed_size(logrewards, max_trajs, dtype=jnp.float32),
+        traj_indices = pytorch_batch.get_trajectory_indices(consecutive=True)
+        actual_n_trajs = int(traj_indices.max().item()) + 1
+        actual_n_states = len(pytorch_batch)
         
-        'actual_n_states': jnp.array(actual_n_states, dtype=jnp.int32),
-        'actual_n_trajs': jnp.array(actual_n_trajs, dtype=jnp.int32),
+        traj_indices = self.pad_and_convert(traj_indices, self.max_states, fill_value=self.max_trajs, name="traj_indices")
         
-        'orig_terminating_rewards': terminating_rewards,
-        'orig_trajectory_indices': traj_indices_np,
-    }
+        # Get states for policy input
+        states_policy = pytorch_batch.get_states(policy=True)
+        if isinstance(states_policy, list):
+            if len(states_policy) > 0 and isinstance(states_policy[0], torch.Tensor):
+                states_policy = torch.stack(states_policy)
+            else:
+                states_policy = torch.tensor(np.array(states_policy), device=pytorch_batch.device)
+                
+        states = self.pad_and_convert(states_policy, self.max_states, name="states")
+        
+        actions = []
+        for i in range(len(pytorch_batch)):
+            action = pytorch_batch.actions[i]
+            traj_idx = pytorch_batch.traj_indices[i]
+            env = pytorch_batch.envs[traj_idx]
+            
+            if isinstance(action, tuple):
+                action_idx = env.action2index(action)
+            else:
+                action_idx = action
+            
+            actions.append(action_idx)
+        
+        actions = torch.tensor(actions, dtype=torch.int32, device=pytorch_batch.device)
+        actions = self.pad_and_convert(actions, self.max_states, name="actions")
+        
+        if pytorch_batch.proxy is None:
+            print("WARNING: Batch has no proxy, using zero rewards")
+            terminating_rewards = torch.zeros(pytorch_batch.get_n_trajectories(), dtype=torch.float32, device=pytorch_batch.device)
+        else:
+            terminating_rewards = pytorch_batch.get_terminating_rewards(sort_by="trajectory")
+        
+        terminating_rewards = self.pad_and_convert(terminating_rewards, self.max_trajs, name="terminating_rewards")
+        
+        rewards = pytorch_batch.get_rewards()
+        rewards = self.pad_and_convert(rewards, self.max_states, name="rewards")
+        
+        logrewards = pytorch_batch.get_terminating_rewards(log=True, sort_by="trajectory")
+        logrewards = self.pad_and_convert(logrewards, self.max_trajs, name="logrewards")
+        
+        logprobs_fwd, _ = pytorch_batch.get_logprobs(backward=False)
+        logprobs_bwd, _ = pytorch_batch.get_logprobs(backward=True)
+        
+        logprobs = self.pad_and_convert(logprobs_fwd, self.max_states, name="logprobs")
+        logprobs_rev = self.pad_and_convert(logprobs_bwd, self.max_states, name="logprobs_rev")
+        
+        parents_policy = pytorch_batch.get_parents(policy=True)
+        if isinstance(parents_policy, list):
+            if len(parents_policy) > 0 and isinstance(parents_policy[0], torch.Tensor):
+                parents_policy = torch.stack(parents_policy)
+            else:
+                parents_policy = torch.tensor(np.array(parents_policy), device=pytorch_batch.device)
+        
+        parents_policy = self.pad_and_convert(parents_policy, self.max_states, name="parents_policy")
+
+        masks_forward_pt = pytorch_batch.get_masks_forward(of_parents=True)
+        masks_backward_pt = pytorch_batch.get_masks_backward()
+        
+        masks_forward = self.pad_and_convert(masks_forward_pt, self.max_states, fill_value=1, name="masks_forward")
+        masks_backward = self.pad_and_convert(masks_backward_pt, self.max_states, fill_value=1, name="masks_backward")
+        
+        return {
+            'states': states,
+            'parents_policy': parents_policy,
+            'actions': actions,
+            'rewards': rewards,
+            'logprobs': logprobs,
+            'logprobs_rev': logprobs_rev,
+            'trajectory_indices': traj_indices,
+            'masks_forward': masks_forward,
+            'masks_backward': masks_backward,
+            
+            'terminating_rewards': terminating_rewards,
+            'logrewards': logrewards,
+            
+            'actual_n_states': jnp.array(actual_n_states, dtype=jnp.int32),
+            'actual_n_trajs': jnp.array(actual_n_trajs, dtype=jnp.int32),
+        }
 
 
 def _match_linear_layers(pt_model, jax_model, context):
@@ -291,18 +328,12 @@ def apply_params_to_pytorch(jax_params, agent, jax_policies):
             if id(pt_lin) in updated_modules:
                 continue
 
-            w_np = np.asarray(jax_lin.weight, dtype=np.float32)
-            # Make writable to avoid warning
-            w_np = np.copy(w_np)
-            
-            w_t = torch.from_numpy(w_np).to(pt_lin.weight.device, pt_lin.weight.dtype)
+            # JAX -> PyTorch (Zero Copy on GPU)
+            w_t = j2t(jax_lin.weight)
             with torch.no_grad():
                 pt_lin.weight.copy_(w_t)
 
-            b_np = np.asarray(jax_lin.bias, dtype=np.float32)
-            b_np = np.copy(b_np)
-            
-            b_t = torch.from_numpy(b_np).to(pt_lin.bias.device, pt_lin.bias.dtype)
+            b_t = j2t(jax_lin.bias)
             with torch.no_grad():
                 pt_lin.bias.copy_(b_t)
             
@@ -336,8 +367,7 @@ def apply_params_to_pytorch(jax_params, agent, jax_policies):
 
         # ---------- logZ ----------
         if jax_params.get("logZ", None) is not None and agent.logZ is not None:
-            logZ_np = np.asarray(jax_params["logZ"])
-            logZ_t = torch.from_numpy(logZ_np).to(agent.logZ.device, agent.logZ.dtype)
+            logZ_t = j2t(jax_params["logZ"])
             agent.logZ.data.copy_(logZ_t)
 
     except Exception as e:
@@ -413,7 +443,18 @@ def train(agent, config):
     #TODO: find the right sizes for states and trajectories
     n_trajs_per_sample = agent.batch_size.forward + agent.batch_size.backward_dataset + agent.batch_size.backward_replay
     MAX_TRAJS = int(n_trajs_per_sample * agent.sttr) 
-    MAX_STATES = config.env.length ** config.env.n_dim
+    
+    # Heuristic for max states in a batch
+    max_traj_len = 0
+    if hasattr(config.env, 'max_step'):
+        max_traj_len = config.env.max_step
+    elif hasattr(config.env, 'length') and hasattr(config.env, 'n_dim'):
+        max_traj_len = config.env.length * config.env.n_dim
+    else:
+        max_traj_len = 100 # Fallback
+        
+    MAX_STATES = int(MAX_TRAJS * max_traj_len * 1.2) # 20% buffer
+    
     print(f"JAX Compilation Config: MAX_TRAJS={MAX_TRAJS}, MAX_STATES={MAX_STATES}")
 
     @partial(jit, static_argnames=['loss_type', 'debug'])
@@ -531,9 +572,14 @@ def train(agent, config):
         disable=agent.logger.progressbar.get("skip", False),
     )
     
+    
+    # Initialize batch converter
+    batch_converter = JAXBatchConverter(MAX_STATES, MAX_TRAJS, agent.device)
+
     for iteration in range(agent.it, agent.n_train_steps + 1):
         
-        jax.debug.print("=== TRAINING ITERATION {} ===", iteration)
+        # jax.debug.print("=== TRAINING ITERATION {} ===", iteration)
+        t0 = time.time()
         
         batch = Batch(
             env=agent.env,
@@ -553,8 +599,11 @@ def train(agent, config):
             )
             batch.merge(sub_batch)
         
-        batch_arrays = convert_batch_to_jax_arrays(batch, MAX_STATES, MAX_TRAJS)
+        t1 = time.time()
+        
+        batch_arrays = batch_converter(batch)
 
+        t2 = time.time()
 
         # Perform multiple gradient steps (train-to-sample ratio)
         for _ in range(agent.ttsr):
@@ -562,7 +611,16 @@ def train(agent, config):
                 jax_params, opt_state, batch_arrays, optimizer, loss_type=loss_type
             )
             
-        apply_params_to_pytorch(jax_params, agent, jax_policies)
+        t3 = time.time()
+        
+        # Sync parameters back to PyTorch (every 10 iterations to save time)
+        if iteration % 10 == 0:
+            apply_params_to_pytorch(jax_params, agent, jax_policies)
+        
+        t4 = time.time()
+        
+        if iteration % 10 == 0:
+             print(f"Iter {iteration}: Sample={t1-t0:.4f}s, Convert={t2-t1:.4f}s, Train={t3-t2:.4f}s, Sync={t4-t3:.4f}s")
         
         #! Buffer
         # states_term = batch.get_terminating_states(sort_by="trajectory")
