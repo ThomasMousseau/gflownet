@@ -932,34 +932,19 @@ class GFlowNetAgent:
 
     def train(self):
 
-        #! JAX conversion debugging
-        # from gflownet.trainers.jax_minimal import (
-        #     convert_params_to_jax,
-        #     apply_params_to_pytorch,
-        #     sync_params_from_pytorch_to_jax,
-        # )
-        # import jax
-        # key = jax.random.PRNGKey(0)
-        # jax_params, jax_policies = convert_params_to_jax(self, config, key)  # config not needed here
-    
-        # Train loop
         pbar = tqdm(
             initial=self.it - 1,
             total=self.n_train_steps,
             disable=self.logger.progressbar["skip"],
         )
         for self.it in range(self.it, self.n_train_steps + 1):
-            # Test and log
             print(f"\n=== Iteration {self.it} ===")
             if self.evaluator.should_eval(self.it):
                 self.evaluator.eval_and_log(self.it)
             if self.evaluator.should_eval_top_k(self.it):
                 self.evaluator.eval_and_log_top_k(self.it)
                 
-            #! JAX conversion debugging
-            # apply_params_to_pytorch(jax_params, self, jax_policies)
-
-            t0_iter = time.time()
+            t0 = time.time()
             batch = Batch(
                 env=self.env,
                 proxy=self.proxy,
@@ -976,14 +961,10 @@ class GFlowNetAgent:
                 )
                 batch.merge(sub_batch)
                 
+            t1 = time.time()
+                
             for j in range(self.ttsr):
                 
-                # #! TO COMMENT AFTER RNG DEBUGGING
-                # if self.it == 1:
-                #     saved_batch = batch 
-                # if self.it <= 10:
-                #     batch = saved_batch
-    
                 losses = self.loss.compute(batch, get_sublosses=True)
                 # TODO: deal with this in a better way
                 if not all([torch.isfinite(loss) for loss in losses.values()]):
@@ -999,23 +980,32 @@ class GFlowNetAgent:
                     self.opt.step()
                     self.lr_scheduler.step()
                     self.norm_grad_foward_first_layer = torch.norm(self.forward_policy.model[0].weight.grad)
-                    print(f"PyTorch grad_forward_layer0_norm: {torch.norm(self.forward_policy.model[0].weight.grad):.10f}")
+                    # print(f"PyTorch grad_forward_layer0_norm: {torch.norm(self.forward_policy.model[0].weight.grad):.10f}")
                     self.opt.zero_grad()
-                    # !UNCOMMENT AFTER RNG DEBUGGING
                     batch.zero_logprobs()
                     
                     
-            #! JAX conversion debugging
-            # jax_params, jax_policies = sync_params_from_pytorch_to_jax(
-            #     self, jax_params, jax_policies
-            # )
-
+            t2 = time.time()
+                
             times = self.log_train_iteration(pbar, losses, batch, times)
 
             # Log times
-            t1_iter = time.time()
-            times.update({"iter": t1_iter - t0_iter})
-            self.logger.log_time(times, use_context=self.use_context)
+            # t1_iter = time.time()
+            # times.update({"iter": t1_iter - t0_iter})
+            # self.logger.log_time(times, use_context=self.use_context)
+            
+            time_sample = t1 - t0
+            time_train = t2 - t1
+            self.logger.log_metrics(
+                metrics={
+                    "time_sample": time_sample,
+                    "time_train": time_train,
+                },
+                step=self.it,
+                use_context=self.use_context,
+            )
+            
+            print(f"Iteration: {self.it} sampling time: {time_sample:.4f}s, training time: {time_train:.4f}s")
 
             # Garbage collection and cleanup GPU memory
             if (

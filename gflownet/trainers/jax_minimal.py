@@ -572,13 +572,10 @@ def train(agent, config):
         disable=agent.logger.progressbar.get("skip", False),
     )
     
-    
-    # Initialize batch converter
     batch_converter = JAXBatchConverter(MAX_STATES, MAX_TRAJS, agent.device)
 
     for iteration in range(agent.it, agent.n_train_steps + 1):
         
-        # jax.debug.print("=== TRAINING ITERATION {} ===", iteration)
         t0 = time.time()
         
         batch = Batch(
@@ -610,17 +607,24 @@ def train(agent, config):
             jax_params, opt_state, loss_value, grads = jax_grad_step(
                 jax_params, opt_state, batch_arrays, optimizer, loss_type=loss_type
             )
+        jax_params['forward_policy_trainable'][0].weight.block_until_ready()
+        jax_params['backward_policy_trainable'][0].weight.block_until_ready()
+        jax_params['logZ'].block_until_ready()
+
             
         t3 = time.time()
         
-        # Sync parameters back to PyTorch (every 10 iterations to save time)
-        if iteration % 10 == 0:
-            apply_params_to_pytorch(jax_params, agent, jax_policies)
+        apply_params_to_pytorch(jax_params, agent, jax_policies)
         
         t4 = time.time()
         
+        time_sample = t1 - t0
+        time_convert = t2 - t1
+        time_train = t3 - t2
+        time_sync = t4 - t3
+        
         if iteration % 10 == 0:
-             print(f"Iter {iteration}: Sample={t1-t0:.4f}s, Convert={t2-t1:.4f}s, Train={t3-t2:.4f}s, Sync={t4-t3:.4f}s")
+            print(f"Iter {iteration}: Sample={time_sample:.4f}s, Convert={time_convert:.4f}s, Train={time_train:.4f}s, Sync={time_sync:.4f}s")
         
         #! Buffer
         # states_term = batch.get_terminating_states(sort_by="trajectory")
@@ -694,6 +698,10 @@ def train(agent, config):
                 "Learning rate logZ": lr_logz,
                 "grad_logZ_mean": float(grad_logZ.mean()),
                 "first_layer_grad_norm": float(jnp.linalg.norm(grads['forward_policy_trainable'].layers[0].weight)),
+                "time_sample": time_sample,
+                "time_convert": time_convert,
+                "time_train": time_train,
+                "time_sync": time_sync,
             }
 
             agent.logger.log_metrics(

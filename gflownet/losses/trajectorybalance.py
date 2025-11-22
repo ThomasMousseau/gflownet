@@ -107,27 +107,6 @@ class TrajectoryBalance(BaseLoss):
         )
         # Get rewards from batch
         logrewards = batch.get_terminating_rewards(log=True, sort_by="trajectory")
-
-        # Trajectory balance loss
-        logprob_ratios = logprobs_f - logprobs_b
-        log_rewards = logrewards
-        # losses = (self.logZ.sum() + logprob_ratios - log_rewards).pow(2)
-        
-        #! DEBUG FOR OPTIMIZER
-        print("=== PYTORCH LOSS COMPONENTS ===")
-        print(f"logZ: {self.logZ.sum().item():.6f}")
-        print(f"logprob_ratios (first 3): {logprob_ratios[:3].detach().cpu().numpy()}")
-        print(f"log_rewards (first 3): {log_rewards[:3].detach().cpu().numpy()}")
-        print(f"logprob_ratios - log_rewards (first 3): {(logprob_ratios - log_rewards)[:3].detach().cpu().numpy()}")
-        print(f"logZ + logprob_ratios - log_rewards (first 3): {(self.logZ.sum() + logprob_ratios - log_rewards)[:3].detach().cpu().numpy()}")
-
-        # Individual logprobs
-        print(f"logprobs_f (first 5): {batch.logprobs_forward[:5].detach().cpu().numpy()}")
-        print(f"logprobs_b (first 5): {batch.logprobs_backward[:5].detach().cpu().numpy()}")
-
-        # Trajectory info
-        print(f"n_trajs: {batch.get_n_trajectories()}")
-        print(f"traj_indices (first 10): {batch.get_trajectory_indices()[:10].cpu().numpy()}")
                 
         return (self.logZ.sum() + logprobs_f - logprobs_b - logrewards).pow(2)
 
