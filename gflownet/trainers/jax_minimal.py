@@ -76,7 +76,7 @@ class JAXBatchConverter:
         actual_n_trajs = int(traj_indices.max().item()) + 1
         actual_n_states = len(pytorch_batch)
         
-        traj_indices = self.pad_and_convert(traj_indices, self.max_states, fill_value=self.max_trajs, name="traj_indices")
+        traj_indices = self.pad_and_convert(traj_indices, self.max_states, fill_value=self.max_trajs, name="traj_indices") #! fill_value=self.max_trajs
         
         # Get states for policy input
         states_policy = pytorch_batch.get_states(policy=True)
@@ -427,24 +427,10 @@ def train(agent, config):
     opt_state = optimizer.init(jax_params)
     loss_type = config.loss.get('_target_', 'trajectorybalance').split('.')[-1].lower()
     
-    # has_trainable = (
-    #     'forward_policy_trainable' in jax_params and jax_params['forward_policy_trainable'] is not None or 
-    #     'backward_policy_trainable' in jax_params and jax_params['backward_policy_trainable'] is not None or 
-    #     jax_params.get('logZ') is not None
-    # )
-    
-    # if not has_trainable:
-    #     print("WARNING: No trainable parameters found!")
-    #     print("  - Forward policy is not a neural network model")
-    #     print("  - Backward policy is not a neural network model")
-    #     print("  - LogZ is None")
-    #     print("  Training will proceed but parameters won't be updated.")
-    
     #TODO: find the right sizes for states and trajectories
     n_trajs_per_sample = agent.batch_size.forward + agent.batch_size.backward_dataset + agent.batch_size.backward_replay
     MAX_TRAJS = int(n_trajs_per_sample * agent.sttr) 
     
-    # Heuristic for max states in a batch
     max_traj_len = 0
     if hasattr(config.env, 'max_step'):
         max_traj_len = config.env.max_step
@@ -454,6 +440,8 @@ def train(agent, config):
         max_traj_len = 100 # Fallback
         
     MAX_STATES = int(MAX_TRAJS * max_traj_len * 1.2) # 20% buffer
+    
+    # MAX_STATES = config.env.length ** config.env.n_dim
     
     print(f"JAX Compilation Config: MAX_TRAJS={MAX_TRAJS}, MAX_STATES={MAX_STATES}")
 
