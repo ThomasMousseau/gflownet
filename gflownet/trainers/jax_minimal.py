@@ -470,36 +470,27 @@ def train(agent, config):
             else:
                 model_b = jax_policies['backward'].model
             
-            # Get logZ
-            # logZ = params.get('logZ', jnp.array(0.0))
-            # if logZ is not None and logZ.ndim > 0:
-            #     logZ = jnp.sum(logZ)
-            
             logZ = params['logZ']
             if logZ.ndim > 0: logZ = jnp.sum(logZ)
                                 
             logits_f = jax.vmap(model_f)(batch_arrays['parents_policy'])
             logits_f_masked = jnp.where(batch_arrays['masks_forward'], -jnp.inf, logits_f)
             logprobs_f_all = jax.nn.log_softmax(logits_f_masked, axis=1)
-            # logprobs_f = logprobs_f_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
             logprobs_f = logprobs_f_all[jnp.arange(MAX_STATES), batch_arrays['actions']]
 
-            # Zero out logprobs for padded states so they don't affect sum
-            # (We use state_mask where 1=valid, 0=padded)
             state_mask = jnp.arange(MAX_STATES) < batch_arrays['actual_n_states']
             logprobs_f = logprobs_f * state_mask
 
-            logits_b = jax.vmap(model_b)(batch_arrays['states']) #! states_policy
+            logits_b = jax.vmap(model_b)(batch_arrays['states']) 
             logits_b_masked = jnp.where(batch_arrays['masks_backward'], -jnp.inf, logits_b)
             logprobs_b_all = jax.nn.log_softmax(logits_b_masked, axis=1)
-            # logprobs_b = logprobs_b_all[jnp.arange(len(batch_arrays['actions'])), batch_arrays['actions']]
             logprobs_b = logprobs_b_all[jnp.arange(MAX_STATES), batch_arrays['actions']]
             logprobs_b = logprobs_b * state_mask
             
             traj_indices = batch_arrays['trajectory_indices']
             
-            segment_ids = traj_indices + 1  # Shift so -1 -> 0, 0 -> 1, etc.
-            num_segments = MAX_TRAJS + 1    # +1 for the "garbage" bin at index 0
+            segment_ids = traj_indices + 1  
+            num_segments = MAX_TRAJS + 1    
             
             sum_logprobs_f = jax.ops.segment_sum(logprobs_f, segment_ids, num_segments=num_segments)
             sum_logprobs_b = jax.ops.segment_sum(logprobs_b, segment_ids, num_segments=num_segments)
@@ -509,33 +500,9 @@ def train(agent, config):
             
             logprob_ratios = sum_logprobs_f - sum_logprobs_b
             
-            # def compute_traj_logprob_ratio(traj_idx):
-            #     mask = (traj_indices == traj_idx).astype(jnp.float32)
-            #     log_pF = jnp.sum(logprobs_f * mask)
-            #     log_pB = jnp.sum(logprobs_b * mask)
-            #     return log_pF - log_pB
-            #logprob_ratios = jax.vmap(compute_traj_logprob_ratio)(jnp.arange(MAX_TRAJS))
-            # logprob_ratios = jnp.array([compute_traj_logprob_ratio(tidx) for tidx in jnp.arange(n_trajs)])
-    
             log_rewards = batch_arrays['logrewards']
             
             losses = (logZ + logprob_ratios - log_rewards) ** 2
-            # return jnp.mean(losses)
-            
-            # jax.debug.print("=== JAX LOSS COMPONENTS ===")
-            # jax.debug.print("logZ: {}", logZ)
-            # jax.debug.print("logprob_ratios (first 3): {}", logprob_ratios[:3])
-            # jax.debug.print("log_rewards (first 3): {}", log_rewards[:3])
-            # jax.debug.print("logprob_ratios - log_rewards (first 3): {}", (logprob_ratios - log_rewards)[:3])
-            # jax.debug.print("logZ + logprob_ratios - log_rewards (first 3): {}", (logZ + logprob_ratios - log_rewards)[:3])
-
-            # # Individual logprobs
-            # jax.debug.print("logprobs_f (first 5): {}", logprobs_f[:5])
-            # jax.debug.print("logprobs_b (first 5): {}", logprobs_b[:5])
-
-            # # Trajectory grouping
-            # jax.debug.print("n_trajs: {}", n_trajs)
-            # jax.debug.print("traj_indices (first 10): {}", traj_indices[:10])
             
             #! Average over actual trajectories and avoid division by zero
             traj_mask = jnp.arange(MAX_TRAJS) < batch_arrays['actual_n_trajs']
@@ -544,7 +511,6 @@ def train(agent, config):
             return loss_sum / (n_valid + 1e-8)
             
         return jnp.array(0.0)
-        # return jnp.mean((batch_arrays['logprobs'] - batch_arrays['logprobs_rev']) ** 2)
     
     @partial(jit, static_argnames=['optimizer','loss_type'])
     def jax_grad_step(params, opt_state, batch_arrays, optimizer, loss_type=loss_type):
@@ -602,7 +568,6 @@ def train(agent, config):
 
         t2 = time.time()
 
-        # Perform multiple gradient steps (train-to-sample ratio)
         for _ in range(agent.ttsr):
             jax_params, opt_state, loss_value, grads = jax_grad_step(
                 jax_params, opt_state, batch_arrays, optimizer, loss_type=loss_type
@@ -685,7 +650,6 @@ def train(agent, config):
             lr_logz = float(lr_schedule_logz(iteration))
             grad_logZ = np.asarray(grads["logZ"], dtype=np.float32)
 
-            # ---------- Scalar metrics exactly like original ----------
             metrics = {
                 "step": iteration,
                 "Trajectory lengths mean": traj_length_mean,
