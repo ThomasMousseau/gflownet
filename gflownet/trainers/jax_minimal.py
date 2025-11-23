@@ -18,10 +18,6 @@ from gflownet.utils.batch import Batch
 from gflownet.policy.base_jax import PolicyJAX
 from gflownet.utils.policy import parse_policy_config
 
-# ============================================================================
-# PHASE 1: Minimal JAX - Only JIT the gradient step
-# ============================================================================
-
 def t2j(tensor):
     """Convert PyTorch tensor to JAX array via DLPack (zero-copy if possible)."""
     if isinstance(tensor, torch.Tensor):
@@ -193,10 +189,6 @@ def convert_params_to_jax(agent, config, key):
 
     jax_params = {}
     jax_policies = {}
-
-    # ------------------------------------------------------------------
-    # FORWARD POLICY
-    # ------------------------------------------------------------------
     
     forward_config = parse_policy_config(config, kind="forward")
     forward_config = forward_config["config"]
@@ -241,10 +233,6 @@ def convert_params_to_jax(agent, config, key):
         else:
             jax_params["forward_policy_trainable"] = None
             jax_policies["forward_static"] = None
-
-    # ------------------------------------------------------------------
-    # BACKWARD POLICY
-    # ------------------------------------------------------------------
     
     backward_config = parse_policy_config(config, kind="backward")
     backward_config = backward_config["config"]
@@ -301,10 +289,6 @@ def convert_params_to_jax(agent, config, key):
         else:
             jax_params["backward_policy_trainable"] = None
             jax_policies["backward_static"] = None
-
-    # ------------------------------------------------------------------
-    # logZ
-    # ------------------------------------------------------------------
     
     if agent.logZ is not None:
         jax_params["logZ"] = jnp.array(agent.logZ.detach().cpu().numpy(), dtype=jnp.float32)
