@@ -19,3 +19,5 @@ logs
 
 gflownet-env/
 wandb/
+
+.tmp.driveupload
