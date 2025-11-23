@@ -10,6 +10,9 @@ defaults:
   - evaluator: base
   - buffer: base
 
+trainer:
+  mode: legacy # legacy|pure|jax
+
 # Device
 device: cpu
 # Float precision

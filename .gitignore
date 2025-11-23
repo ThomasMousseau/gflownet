@@ -16,3 +16,6 @@ playground/
 .DS_Store
 docs/_build/
 logs
+
+gflownet-env/
+wandb/
