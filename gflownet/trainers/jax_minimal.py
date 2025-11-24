@@ -544,7 +544,7 @@ def train(agent, config):
             jax_params, opt_state, loss_value, grads = jax_grad_step(
                 jax_params, opt_state, batch_arrays, optimizer, loss_type=loss_type
             )
-        jax_params['forward_policy_trainable'][0].weight.block_until_ready()
+        jax_params['forward_policy_trainable'][0].weight.block_until_ready() #To prevent async issues
         jax_params['backward_policy_trainable'][0].weight.block_until_ready()
         jax_params['logZ'].block_until_ready()
 
