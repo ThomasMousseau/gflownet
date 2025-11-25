@@ -10,7 +10,9 @@ from collections import defaultdict
 WANDB_ENTITY = "fatty_data" 
 WANDB_PROJECT = "GFlowNet-Experiments" 
 METRIC_NAME = "time_train"
+METRIC_NAME_SMOOTH = "time_train_smooth"
 TARGET_STEPS = 5000 
+WINDOW = 20
 
 EXPERIMENT_GROUPS = {
     "neural-nets": "mlp",
@@ -43,6 +45,16 @@ def get_run_partially_failed(api, project_path, group_tag):
 
 
 def estimate_total_time(history, target_steps=5000, window=500):
+    """
+    Estimate total training time based on logged history.
+    If the run has not reached target_steps, estimate the remaining time
+    using the average time per iteration from the last `window` logged points.
+    Returns:
+        estimated_total_time (float): Estimated total training time.
+        actual_total_time (float): Actual logged training time.
+        max_step (int): Maximum step reached in the run.
+        was_estimated (bool): Whether the total time was estimated due to crash.
+    """
     if history.empty or '_step' not in history or METRIC_NAME not in history:
         return 0, 0, 0, False
     
@@ -57,9 +69,14 @@ def estimate_total_time(history, target_steps=5000, window=500):
     if max_step >= target_steps:
         return actual_total, actual_total, max_step, False
     
-    last_values = valid_history[METRIC_NAME].tail(window).values
-    avg_time_per_iter = np.mean(last_values)
+    cutoff_step = max_step - window
+    recent_history = valid_history[valid_history['_step'] > cutoff_step]
     
+    if not recent_history.empty:
+        avg_time_per_iter = recent_history[METRIC_NAME].mean()
+    else:
+        avg_time_per_iter = valid_history[METRIC_NAME].mean()
+        
     n_logged_points = len(valid_history)
     if n_logged_points > 1:
         steps_per_point = max_step / n_logged_points
@@ -95,26 +112,25 @@ def parse_run_info(run, param_prefix):
     if not framework or param_value is None:
         return None
 
-    history = run.history(keys=[METRIC_NAME, "_step"])
+    history_table = run.history(samples=5000,keys=[METRIC_NAME, "_step"]) #! alaways retuns 500 points
+    history_graph = run.history(samples=500, keys=[METRIC_NAME, "_step"]) 
     
-    if METRIC_NAME not in history:
-        return None
     
     # Calculate total time (estimated if crashed)
     estimated_total, actual_total, max_step, was_estimated = estimate_total_time(
-        history, target_steps=TARGET_STEPS
+        history_table, target_steps=TARGET_STEPS
     )
     
-    if was_estimated:
-        print(f"  [Estimate] Run {run.name}: crashed at step {max_step}, "
-              f"actual={actual_total:.2f}s, estimated={estimated_total:.2f}s")
+    # if was_estimated:
+    #     print(f"  [Estimate] Run {run.name}: crashed at step {max_step}, "
+    #           f"actual={actual_total:.2f}s, estimated={estimated_total:.2f}s")
 
     return {
         "id": run.id,
         "name": run.name,
         "framework": framework,
         "parameter": param_value,
-        "history": history,
+        "history": history_graph,
         "total_time": estimated_total,  # Use estimated total for table
         "actual_time": actual_total,
         "max_step": max_step,
@@ -203,6 +219,12 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
 
     min_max_step = min(item["max_step"] for item in data)
     
+    full_df["time_train_smooth"] = (
+        full_df
+        .groupby(["Parameter", "Framework"])[METRIC_NAME]
+        .transform(lambda s: s.rolling(window=WINDOW, min_periods=1).mean())
+    )
+    
     # ========== PLOT 1: FULL PLOT (0 to 5000) ==========
     plt.figure(figsize=(12, 8))
     sns.set_style("whitegrid")
@@ -210,7 +232,7 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
     sns.lineplot(
         data=full_df,
         x="_step",
-        y=METRIC_NAME,
+        y=METRIC_NAME_SMOOTH,
         hue="Parameter",
         style="Framework",
         markers=False,
@@ -230,6 +252,12 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
 
     # ========== PLOT 2: TRUNCATED PLOT (0 to min_max_step) ==========
     truncated_df = full_df[full_df["_step"] <= min_max_step]
+
+    truncated_df["time_train_smooth"] = (
+        truncated_df
+        .groupby(["Parameter", "Framework"])[METRIC_NAME]
+        .transform(lambda s: s.rolling(window=WINDOW, min_periods=1).mean())
+    )
     
     plt.figure(figsize=(12, 8))
     sns.set_style("whitegrid")
@@ -237,12 +265,11 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
     sns.lineplot(
         data=truncated_df,
         x="_step",
-        y=METRIC_NAME,
+        y=METRIC_NAME_SMOOTH,
         hue="Parameter",
         style="Framework",
         markers=False,
-        palette="viridis",
-        errorbar=('ci', 95)
+        palette="viridis"
     )
     
     plt.title(f"Training Speed Comparison: {group_name} (Truncated to {min_max_step} steps)")
@@ -258,12 +285,13 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
 if __name__ == "__main__":
 
     #! Neural Networks Experiments
-    process_experiment_group("neural-nets", "exp_mlp", "nlayers_", has_failed_experiments=True)
-    #process_experiment_group("neural-nets", "exp_mlp", "ndim_")
+    #process_experiment_group("neural-nets", "exp_mlp", "nlayers_", has_failed_experiments=True)
+    #process_experiment_group("neural-nets", "exp_mlp", "nhid_")
     
     #! Environment Experiments
-    # process_experiment_group("environment", "exp_environment", "length_")
-    # process_experiment_group("environment", "exp_environment", "ndim_")
+    process_experiment_group("environment", "exp_env", "length_", has_failed_experiments=True)
+    process_experiment_group("environment", "exp_env", "dim_", has_failed_experiments=True)
+    process_experiment_group("environment", "exp_env", "env_")
     
     #! Hyperparameters Experiments
     #process_experiment_group("hyperparameters", "exp_hyperparam", "batchsize_")
