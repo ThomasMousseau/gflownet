@@ -7,6 +7,7 @@ import equinox as eqx
 import torch.nn as nn
 import torch
 import optax
+import gc
 from functools import partial
 from tqdm import tqdm
 from torch.utils.dlpack import to_dlpack as torch_to_dlpack
@@ -423,7 +424,7 @@ def train(agent, config):
     else:
         max_traj_len = 100 # Fallback
         
-    MAX_STATES = int(MAX_TRAJS * max_traj_len * 1.2) # 20% buffer
+    MAX_STATES = int(MAX_TRAJS * max_traj_len) #! used to add a 20% buffer
     
     # MAX_STATES = config.env.length ** config.env.n_dim
     
@@ -667,6 +668,15 @@ def train(agent, config):
         
         if agent.evaluator.should_eval(iteration):
             agent.evaluator.eval_and_log(iteration)
+            
+        if (
+            agent.garbage_collection_period > 0
+            and agent.garbage_collection_period % iteration == 0
+        ):
+            del batch
+            del batch_arrays
+            gc.collect()
+            torch.cuda.empty_cache()
 
     pbar.close()
     
