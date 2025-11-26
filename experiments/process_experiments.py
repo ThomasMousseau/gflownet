@@ -289,15 +289,15 @@ if __name__ == "__main__":
     #process_experiment_group("neural-nets", "exp_mlp", "nhid_")
     
     #! Environment Experiments
-    process_experiment_group("environment", "exp_env", "length_", has_failed_experiments=True)
-    process_experiment_group("environment", "exp_env", "dim_", has_failed_experiments=True)
-    process_experiment_group("environment", "exp_env", "env_")
+    # process_experiment_group("environment", "exp_env", "length_", has_failed_experiments=True)
+    # process_experiment_group("environment", "exp_env", "dim_", has_failed_experiments=True)
+    # process_experiment_group("environment", "exp_env", "env_")
     
     #! Hyperparameters Experiments
     #process_experiment_group("hyperparameters", "exp_hyperparam", "batchsize_")
     #process_experiment_group("hyperparameters", "exp_hyperparam", "trajectory_")
     
     #! Hardware Experiments
-    #process_experiment_group("hardware", "exp_hardware", "gpu_")
+    process_experiment_group("hardware", "exp_hardware", "hardware_", has_failed_experiments=True)
     
     
