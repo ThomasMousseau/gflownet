@@ -38,7 +38,7 @@ def get_runs(api, project_path, group_tag):
 def get_run_partially_failed(api, project_path, group_tag):
     filters = {
         "tags": {"$in": [group_tag]},
-        "state": {"$in": ["finished", "crashed"]}
+        "state": {"$in": ["finished", "crashed", "killed"]}
     }
     runs = api.runs(project_path, filters=filters)
     return runs
