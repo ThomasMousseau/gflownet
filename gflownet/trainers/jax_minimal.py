@@ -1,3 +1,8 @@
+# import os
+# # Configure JAX to use standard malloc and disable preallocation to prevent OOM on CPU
+# os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+# os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+
 import time
 import jax
 import jax.numpy as jnp
@@ -20,14 +25,24 @@ from gflownet.policy.base_jax import PolicyJAX
 from gflownet.utils.policy import parse_policy_config
 
 def t2j(tensor):
-    """Convert PyTorch tensor to JAX array via DLPack (zero-copy if possible)."""
+    """
+    Convert PyTorch tensor to JAX array.
+    
+    NOTE: We use a CPU fallback (numpy) here to avoid a known memory leak 
+    with JAX/PyTorch DLPack interop. While slightly slower due to host 
+    roundtrip, it ensures stable memory usage.
+    """
     if isinstance(tensor, torch.Tensor):
-        return jax_from_dlpack(tensor.detach().contiguous())
+        return jnp.array(tensor.detach().cpu().numpy())
     return jnp.array(tensor)
 
 def j2t(array):
-    """Convert JAX array to PyTorch tensor via DLPack (zero-copy if possible)."""
-    return torch_from_dlpack(array)
+    """
+    Convert JAX array to PyTorch tensor.
+    
+    NOTE: Using CPU fallback to avoid DLPack memory leaks.
+    """
+    return torch.from_numpy(np.array(array))
 
 class JAXBatchConverter:
     def __init__(self, max_states, max_trajs, device):
@@ -38,11 +53,10 @@ class JAXBatchConverter:
 
     def pad_and_convert(self, tensor, size, fill_value=0, name=""):
         curr_size = tensor.shape[0]
-        if curr_size == size:
-            return t2j(tensor)
         
         if curr_size > size:
-            return t2j(tensor[:size])
+            tensor = tensor[:size]
+            curr_size = size
 
         key = name
         if key not in self.buffers:
@@ -82,6 +96,10 @@ class JAXBatchConverter:
                 states_policy = torch.stack(states_policy)
             else:
                 states_policy = torch.tensor(np.array(states_policy), device=pytorch_batch.device)
+        
+        # Ensure states is 2D (N, state_dim)
+        # if states_policy.ndim == 1:
+        #     states_policy = states_policy.reshape(-1, self.state_dim)
                 
         states = self.pad_and_convert(states_policy, self.max_states, name="states")
         
@@ -128,6 +146,10 @@ class JAXBatchConverter:
             else:
                 parents_policy = torch.tensor(np.array(parents_policy), device=pytorch_batch.device)
         
+        # Ensure parents_policy is 2D (N, state_dim)
+        # if parents_policy.ndim == 1:
+        #     parents_policy = parents_policy.reshape(-1, self.state_dim)
+
         parents_policy = self.pad_and_convert(parents_policy, self.max_states, name="parents_policy")
 
         masks_forward_pt = pytorch_batch.get_masks_forward(of_parents=True)
@@ -424,7 +446,7 @@ def train(agent, config):
     else:
         max_traj_len = 100 # Fallback
         
-    MAX_STATES = int(MAX_TRAJS * max_traj_len) #! used to add a 20% buffer
+    MAX_STATES = int(MAX_TRAJS * max_traj_len * 1.2) #! used to add a 20% buffer
     
     # MAX_STATES = config.env.length ** config.env.n_dim
     
@@ -580,11 +602,12 @@ def train(agent, config):
         #! Logging WandB 
         if agent.evaluator.should_log_train(iteration):
 
-            rewards = jnp.asarray(batch_arrays["terminating_rewards"])
-            logrewards = jnp.log(rewards + 1e-8)
+            # Extract raw numpy arrays directly to minimize conversions
+            rewards_np = np.asarray(batch_arrays["terminating_rewards"], dtype=np.float32)
+            logrewards_np = np.log(rewards_np + 1e-8)
 
-            rewards_t    = torch.from_numpy(np.asarray(rewards, dtype=np.float32))
-            logrewards_t = torch.from_numpy(np.asarray(logrewards, dtype=np.float32))
+            rewards_t = torch.from_numpy(rewards_np)
+            logrewards_t = torch.from_numpy(logrewards_np)
 
             proxy_vals = batch_arrays.get("terminating_scores", None)
             if proxy_vals is not None:
@@ -600,6 +623,9 @@ def train(agent, config):
                 prefix="Train batch -",
                 use_context=agent.use_context,
             )
+            
+            #! Explicitly delete intermediate tensors
+            del rewards_t, logrewards_t, proxy_vals_t, rewards_np, logrewards_np
 
             traj_indices = batch_arrays.get("trajectory_indices", None)
             if traj_indices is not None:
@@ -657,26 +683,31 @@ def train(agent, config):
                 step=iteration,
                 use_context=agent.use_context,
             )
-        
+            
+            del metrics, losses, grad_logZ
+
+        term_rewards_for_pbar = np.asarray(batch_arrays["terminating_rewards"], dtype=np.float32)
         agent.logger.progressbar_update(
             pbar,
             float(loss_value),
-            np.asarray(batch_arrays["terminating_rewards"], dtype=np.float32),
+            term_rewards_for_pbar,
             agent.jsd,
             agent.use_context,
         )
+        del term_rewards_for_pbar
         
         if agent.evaluator.should_eval(iteration):
             agent.evaluator.eval_and_log(iteration)
-            
-        if (
-            agent.garbage_collection_period > 0
-            and agent.garbage_collection_period % iteration == 0
-        ):
-            del batch
-            del batch_arrays
+        
+        if hasattr(batch, 'envs'):
+            batch.envs = []
+        
+        del batch
+        del batch_arrays
+        
+        if iteration % 100 == 0:
+            batch_converter.buffers.clear()
             gc.collect()
-            torch.cuda.empty_cache()
 
     pbar.close()
     
@@ -685,4 +716,5 @@ def train(agent, config):
     print(f"  Final loss: {loss_value:.4f}")
     print("=" * 80)
     
+    jax.clear_caches()
     return agent
