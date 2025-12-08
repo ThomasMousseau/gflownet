@@ -285,7 +285,7 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
 if __name__ == "__main__":
 
     #! Neural Networks Experiments
-    #process_experiment_group("neural-nets", "exp_mlp", "nlayers_", has_failed_experiments=True)
+    process_experiment_group("neural-nets", "exp_mlp", "nlayers_", has_failed_experiments=True)
     #process_experiment_group("neural-nets", "exp_mlp", "nhid_")
     
     #! Environment Experiments
@@ -298,6 +298,6 @@ if __name__ == "__main__":
     #process_experiment_group("hyperparameters", "exp_hyperparam", "trajectory_")
     
     #! Hardware Experiments
-    process_experiment_group("hardware", "exp_hardware", "hardware_", has_failed_experiments=True)
+    #process_experiment_group("hardware", "exp_hardware", "hardware_", has_failed_experiments=True)
     
     
