@@ -13,8 +13,7 @@ TrainerFn = Callable[["GFlowNetAgent", Any], Any]
 _TRAINERS: Dict[str, TrainerFn] = {
     "legacy": legacy_trainer.train,
     "pure": pure_trainer.train,
-    "jax": jax_minimal_trainer.train,  # Use minimal JAX trainer
-    "jax_full": jax_trainer.train,  # Keep full version for later
+    "jax": jax_minimal_trainer.train,
 }
 
 

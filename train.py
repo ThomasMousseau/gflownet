@@ -34,13 +34,17 @@ def main(config):
     set_seeds(config.seed)
 
     #! Initialize a GFlowNet agent from the configuration file
-    gflownet = gflownet_from_config(config)
+    if config.trainer.mode == "jax":
+        gflownet = None
+    else:
+        gflownet = gflownet_from_config(config)
+
     trainer = get_trainer(config.trainer.mode)
     trainer(gflownet, config)
 
     # Sample from trained GFlowNet
     # TODO: move to method in GFlowNet agent, like sample_and_log()
-    if config.n_samples > 0 and config.n_samples <= 1e5:
+    if gflownet is not None and config.n_samples > 0 and config.n_samples <= 1e5:
         batch, times = gflownet.sample_batch(n_forward=config.n_samples, train=False)
         x_sampled = batch.get_terminating_states(proxy=True)
         energies = gflownet.proxy(x_sampled)
@@ -58,13 +62,14 @@ def main(config):
         pickle.dump(dct, open(samples_dir / "gfn_samples.pkl", "wb"))
 
     # Print replay buffer
-    if len(gflownet.buffer.replay) > 0:
+    if gflownet is not None and len(gflownet.buffer.replay) > 0:
         print("\nReplay buffer:")
         print(gflownet.buffer.replay)
 
     # Close logger
     # TODO: make it gflownet.end() - perhaps there are other things to end
-    gflownet.logger.end()
+    if gflownet is not None:
+        gflownet.logger.end()
 
 
 def set_seeds(seed):
