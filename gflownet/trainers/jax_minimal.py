@@ -445,11 +445,6 @@ def train(agent, config):
         # Run JIT epoch
         jax_params, opt_state, key, losses, all_log_rewards = train_epoch(jax_params, opt_state, key)
         
-        print(f"Losses epoch {epoch}: {losses}")
-        
-        # Block until done to measure time
-        #losses.block_until_ready()
-        
         t1 = time.time()
         
         # Metrics
@@ -462,7 +457,7 @@ def train(agent, config):
                 "step": current_step,
                 "time_epoch": t1 - t0,
                 "steps_per_sec": steps_per_epoch / (t1 - t0),
-                "loss": avg_loss
+                "all": avg_loss
             }
             logger.log_metrics(metrics, step=current_step, use_context=use_context)
             
@@ -477,6 +472,7 @@ def train(agent, config):
             jsd,
             use_context,
         )
+        pbar.update(steps_per_epoch - 1)
         
         # Evaluation (if needed)
         if agent is not None and evaluator.should_eval(current_step):
