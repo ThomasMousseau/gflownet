@@ -1,6 +1,5 @@
 from typing import Any, Callable, Dict, TYPE_CHECKING
 
-from . import jax as jax_trainer
 from . import jax_minimal as jax_minimal_trainer
 from . import legacy as legacy_trainer
 from . import pure as pure_trainer

@@ -8,10 +8,9 @@ import copy
 import gc
 import pickle
 import time
-from collections import defaultdict
 from functools import partial
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -20,8 +19,6 @@ from torchtyping import TensorType
 from tqdm import tqdm, trange
 
 from gflownet.envs.base import GFlowNetEnv
-from gflownet.evaluator.base import BaseEvaluator
-from gflownet.trainers.jax_minimal import convert_params_to_jax
 from gflownet.utils.batch import Batch, compute_logprobs_trajectories
 from gflownet.utils.common import (
     bootstrap_samples,

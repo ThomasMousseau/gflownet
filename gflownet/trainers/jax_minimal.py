@@ -1,27 +1,16 @@
-# import os
-# # Configure JAX to use standard malloc and disable preallocation to prevent OOM on CPU
-# os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-# os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-
 import time
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import jit, value_and_grad, grad
 import equinox as eqx
-import torch.nn as nn
-import torch
 import optax
 import gc
-from functools import partial
 from tqdm import tqdm
-
 from gflownet.utils.common import instantiate
-from gflownet.policy.base_jax import PolicyJAX
 from gflownet.utils.policy import parse_policy_config
 from gflownet.envs.grid_jax import (
     sample_trajectories_jax,
-    TrajectoryBatch,
     states2proxy_jax,
 )
 
@@ -207,40 +196,10 @@ def train(agent, config):
     n_trajs_total = int(n_trajs_per_sample * sttr)
     
     print(f"Pure JAX Config: n_trajs_per_sample={n_trajs_per_sample}, sttr={sttr}, total={n_trajs_total}")
-
-    def compute_log_rewards(batch: TrajectoryBatch) -> jnp.ndarray:
-        num_trajs = int(batch.actual_n_trajs)
-        if num_trajs == 0 or proxy is None:
-            return jnp.zeros(num_trajs, dtype=jnp.float32)
-
-        states = batch.states.reshape(
-            num_trajs, grid_config.max_traj_length, grid_config.n_dim
-        )
-        traj_lengths = jnp.asarray(batch.actual_lengths, dtype=jnp.int32)
-        last_indices = jnp.clip(traj_lengths - 1, 0)
-        traj_ids = jnp.arange(num_trajs, dtype=jnp.int32)
-        terminal_states = states[traj_ids, last_indices]
-
-        proxy_inputs = states2proxy_jax(terminal_states, grid_config)
-        proxy_inputs_np = np.asarray(proxy_inputs, dtype=np.float32)
-
-        proxy_device = getattr(proxy, "device", device)
-        proxy_dtype = getattr(proxy, "float", torch.float32)
-        states_proxy_t = torch.from_numpy(proxy_inputs_np).to(
-            device=proxy_device, dtype=proxy_dtype
-        )
-
-        with torch.no_grad():
-            logrewards_t = proxy.rewards(states_proxy_t, log=True)
-
-        log_rewards_np = logrewards_t.detach().to("cpu").numpy().reshape(num_trajs)
-        # Clamp to avoid -inf which causes NaN loss
-        log_rewards_np = np.maximum(log_rewards_np, -100.0)
-        return jnp.asarray(log_rewards_np, dtype=jnp.float32)
     
     # Loss function (will be JIT-compiled by jax_grad_step)
-    def jax_loss_and_grad(params, states, parents, actions, action_indices, 
-                         masks_forward, masks_backward, trajectory_indices, 
+    def jax_loss_and_grad(params, states, parents, actions, action_indices,
+                         masks_forward, masks_backward, trajectory_indices,
                          actual_n_states, actual_n_trajs, actual_lengths, log_rewards, loss_type=loss_type):
         """Compute loss and gradients for pure JAX batch."""
         if loss_type == 'trajectorybalance':
@@ -317,12 +276,11 @@ def train(agent, config):
         
         return jnp.array(0.0)
     
-    @partial(jit, static_argnames=['optimizer', 'loss_type', 'actual_n_states', 'actual_n_trajs'])
     def jax_grad_step(params, opt_state, states, parents, actions, action_indices,
                      masks_forward, masks_backward, trajectory_indices,
                      actual_n_states, actual_n_trajs, actual_lengths, log_rewards,
                      optimizer, loss_type=loss_type):
-        """JIT-compiled gradient step for pure JAX."""
+        """Gradient step for pure JAX (called inside scan)."""
         
         loss_value, grads = value_and_grad(jax_loss_and_grad)(
             params, states, parents, actions, action_indices,
@@ -332,107 +290,207 @@ def train(agent, config):
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state, loss_value, grads
-    
-    # Training loop
-    total_iterations = n_train_steps - start_it + 1
-    pbar = tqdm(
-        initial=start_it - 1,
-        total=total_iterations,
-        disable=logger.progressbar.get("skip", False),
-    )
-    
-    for iteration in range(start_it, n_train_steps + 1):
-        t0 = time.time()
+
+    # Extract proxy config
+    proxy_mu = config.proxy.get("mu", 0.75)
+    proxy_sigma = config.proxy.get("sigma", 0.05)
+    proxy_n_dim = config.env.n_dim
+
+    def corners_reward_jax(states, mu, sigma, n_dim):
+        """
+        Pure JAX implementation of the Corners proxy reward.
+        states: (batch_size, n_dim) - normalized states in [-1, 1]
+        """
+        # PyTorch implementation uses abs(states) to map to positive quadrant
+        # and computes distance to mu * ones(n_dim).
+        # This is equivalent to finding the closest corner.
         
-        # Sample trajectories using pure JAX
-        batch, key = sample_trajectories_jax(
-            key=key,
+        mu_vec = mu * jnp.ones(n_dim)
+        
+        # Calculate negative squared Euclidean distance / (2 * sigma^2)
+        # states: (B, D)
+        # mu_vec: (D)
+        
+        # Use abs(states) to fold into positive quadrant
+        diff = jnp.abs(states) - mu_vec[None, :]
+        dist_sq = jnp.sum(diff**2, axis=-1)
+        
+        # Log probability
+        # PyTorch implementation uses sigma as the diagonal of the covariance matrix (variance)
+        # NOT as the standard deviation.
+        # cov = sigma * I
+        # inv(cov) = (1/sigma) * I
+        # term = -0.5 * (x-mu)^T * inv(cov) * (x-mu) = -0.5 * dist_sq / sigma
+        log_prob = -0.5 * dist_sq / sigma
+        
+        # Normalization constant
+        # log(1 / sqrt((2*pi)^D * det(cov)))
+        # det(cov) = sigma^D
+        # log_norm = -0.5 * (D * log(2*pi) + D * log(sigma))
+        log_norm = -0.5 * n_dim * jnp.log(2 * jnp.pi) - 0.5 * n_dim * jnp.log(sigma)
+        
+        return log_prob + log_norm
+
+    def compute_log_rewards_jax(batch, mu, sigma, n_dim):
+        """
+        Pure JAX reward computation.
+        """
+        states = batch.states
+        actual_lengths = batch.actual_lengths
+        
+        num_trajs = actual_lengths.shape[0]
+        total_states = states.shape[0]
+        max_len = total_states // num_trajs
+        
+        # Reshape states to (n_trajs, max_len, n_dim)
+        states_reshaped = states.reshape(num_trajs, max_len, -1)
+
+        # Extract terminal states
+        # Clip indices to be within [0, max_len-1]
+        last_indices = jnp.clip(actual_lengths - 1, 0, max_len - 1)
+        
+        traj_ids = jnp.arange(num_trajs)
+        terminal_states = states_reshaped[traj_ids, last_indices]
+
+        # Convert to proxy input (normalize to [-1, 1])
+        grid_size = grid_config.length
+        proxy_inputs = (terminal_states / (grid_size - 1)) * 2.0 - 1.0
+
+        # Compute rewards
+        log_rewards = corners_reward_jax(proxy_inputs, mu, sigma, n_dim)
+        
+        # Clip rewards
+        log_rewards = jnp.maximum(log_rewards, -100.0)
+        
+        return log_rewards
+
+    # Host-side reward computation removed (Pure JAX now)
+
+    @jit
+    def train_step(jax_params, opt_state, key):
+        """Single training step (sample + reward + train)."""
+        key, subkey = jax.random.split(key)
+        
+        # Reconstruct model for sampling
+        if 'forward_policy_trainable' in jax_params and jax_params['forward_policy_trainable'] is not None:
+            model_f = eqx.combine(jax_params['forward_policy_trainable'], jax_policies['forward_static'])
+        else:
+            model_f = jax_policies['forward'].model
+            
+        # Sample trajectories
+        batch, _ = sample_trajectories_jax(
+            key=subkey,
             config=grid_config,
-            policy_model=jax_policies['forward'].model,
+            policy_model=model_f,
             n_trajectories=n_trajs_total,
             temperature=1.0,
             return_logprobs=False
         )
         
-        t1 = time.time()
-        log_rewards = compute_log_rewards(batch)
+        # Compute rewards in JAX
+        log_rewards = compute_log_rewards_jax(batch, proxy_mu, proxy_sigma, proxy_n_dim)
         
-        # No conversion needed - already JAX!
-        t2 = time.time()
+        # Clip rewards
+        log_rewards = jnp.maximum(log_rewards, -100.0)
         
-        # Train with JAX
-        for _ in range(ttsr):
-            jax_params, opt_state, loss_value, grads = jax_grad_step(
-                jax_params, opt_state, 
+        # Training updates (ttsr loop)
+        def update_body(carry_inner, _):
+            p, o = carry_inner
+            new_p, new_o, l, g = jax_grad_step(
+                p, o, 
                 batch.states, batch.parents, batch.actions, batch.action_indices,
                 batch.masks_forward, batch.masks_backward, batch.trajectory_indices,
-                batch.actual_n_states, batch.actual_n_trajs, batch.actual_lengths, log_rewards,
-                optimizer, loss_type=loss_type
+                batch.actual_n_states, batch.actual_n_trajs, batch.actual_lengths, 
+                log_rewards,
+                optimizer, loss_type
+            )
+            return (new_p, new_o), l
+            
+        if ttsr == 1:
+            (jax_params, opt_state), loss = update_body((jax_params, opt_state), None)
+            step_losses = jnp.reshape(loss, (1,))
+        else:
+            (jax_params, opt_state), step_losses = jax.lax.scan(
+                update_body, (jax_params, opt_state), None, length=ttsr
             )
         
-        loss_value.block_until_ready()
+        return jax_params, opt_state, key, jnp.mean(step_losses), log_rewards
+
+    @jit
+    def train_epoch(jax_params, opt_state, key):
+        """Run a chunk of training steps fully JIT-compiled using scan."""
+        def body_fn(carry, _):
+            params, opt, k = carry
+            new_params, new_opt, new_k, loss, log_rewards = train_step(params, opt, k)
+            return (new_params, new_opt, new_k), (loss, log_rewards)
+
+        (jax_params, opt_state, key), (losses, all_log_rewards) = jax.lax.scan(
+            body_fn, (jax_params, opt_state, key), None, length=steps_per_epoch
+        )
+        return jax_params, opt_state, key, losses, all_log_rewards
+
+    # Training loop
+    steps_per_epoch = 10
+    n_epochs = (n_train_steps - start_it + 1) // steps_per_epoch
+    
+    pbar = tqdm(
+        initial=start_it,
+        total=n_train_steps,
+        disable=logger.progressbar.get("skip", False),
+    )
+    
+    for epoch in range(n_epochs):
+        t0 = time.time()
         
-        t3 = time.time()
+        # Run JIT epoch
+        jax_params, opt_state, key, losses, all_log_rewards = train_epoch(jax_params, opt_state, key)
         
-        # Sync back to PyTorch only when needed
-        # if agent is not None and (iteration % 10 == 0 or evaluator.should_eval(iteration)):
-        #     apply_params_to_pytorch(jax_params, agent, jax_policies)
+        print(f"Losses epoch {epoch}: {losses}")
         
-        t4 = time.time()
+        # Block until done to measure time
+        #losses.block_until_ready()
         
-        time_sample = t1 - t0
-        time_convert = t2 - t1  # Should be ~0
-        time_train = t3 - t2
-        time_sync = t4 - t3
+        t1 = time.time()
         
-        if iteration % 10 == 0:
-            print(f"Iter {iteration}: Sample={time_sample:.4f}s, Convert={time_convert:.6f}s, Train={time_train:.4f}s, Sync={time_sync:.4f}s")
+        # Metrics
+        avg_loss = float(jnp.mean(losses))
+        current_step = start_it + (epoch + 1) * steps_per_epoch
         
         # Logging
-        if evaluator.should_log_train(iteration):
+        if evaluator.should_log_train(current_step):
             metrics = {
-                "step": iteration,
-                "time_sample_jax": time_sample,
-                "time_convert": time_convert,
-                "time_train": time_train,
-                "time_sync": time_sync,
+                "step": current_step,
+                "time_epoch": t1 - t0,
+                "steps_per_sec": steps_per_epoch / (t1 - t0),
+                "loss": avg_loss
             }
+            logger.log_metrics(metrics, step=current_step, use_context=use_context)
             
-            logger.log_metrics(
-                metrics=metrics,
-                step=iteration,
-                use_context=use_context,
-            )
-            
-            losses = {"Loss": float(loss_value)}
-            logger.log_metrics(
-                metrics=losses,
-                step=iteration,
-                use_context=use_context,
-            )
-        
         # Progress bar
+        # Flatten rewards from all steps in epoch
+        flat_rewards = jnp.exp(all_log_rewards).reshape(-1)
+        
         logger.progressbar_update(
             pbar,
-            float(loss_value),
-            jnp.zeros(n_trajs_total),  # Placeholder
+            avg_loss,
+            flat_rewards,
             jsd,
             use_context,
         )
         
-        # Evaluation
-        if agent is not None and hasattr(agent, 'sample_batch') and evaluator.should_eval(iteration):
-            evaluator.eval_and_log(iteration)
-        
+        # Evaluation (if needed)
+        if agent is not None and evaluator.should_eval(current_step):
+            # Note: Evaluation might still be slow/PyTorch-based
+            evaluator.eval_and_log(current_step)
+            
         # Periodic GC
-        if iteration % 100 == 0:
+        if epoch % 10 == 0:
             gc.collect()
     
     pbar.close()
     
-    print("\\n" + "=" * 80)
+    print("\n" + "=" * 80)
     print("PURE JAX TRAINING COMPLETE")
-    print(f"  Final loss: {loss_value:.4f}")
     print("=" * 80)
     
     jax.clear_caches()

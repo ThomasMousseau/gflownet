@@ -614,14 +614,15 @@ class TrajectoryBatch:
             self.masks_backward,
             self.trajectory_indices,
             self.actual_lengths,
+            self.actual_n_states,  # Moved to children because it's dynamic in JIT
         )
-        aux_data = (self.actual_n_states, self.actual_n_trajs)
+        aux_data = (self.actual_n_trajs,)
         return children, aux_data
     
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         """Unflatten from (children, aux_data) to reconstruct TrajectoryBatch."""
-        actual_n_states, actual_n_trajs = aux_data
+        (actual_n_trajs,) = aux_data
         return cls(
             states=children[0],
             parents=children[1],
@@ -631,7 +632,7 @@ class TrajectoryBatch:
             masks_backward=children[5],
             trajectory_indices=children[6],
             actual_lengths=children[7],
-            actual_n_states=actual_n_states,
+            actual_n_states=children[8],
             actual_n_trajs=actual_n_trajs,
         )
 
@@ -781,7 +782,7 @@ def sample_trajectories_jax(
     traj_indices = jnp.repeat(jnp.arange(n_trajectories), max_len)
     
     # Compute actual number of states (sum of trajectory lengths)
-    actual_n_states = int(jnp.sum(trajectory_lengths))
+    actual_n_states = jnp.sum(trajectory_lengths)
     
     batch = TrajectoryBatch(
         states=states_flat,
