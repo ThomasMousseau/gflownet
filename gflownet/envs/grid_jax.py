@@ -688,13 +688,10 @@ def sample_trajectories_jax(
     if return_logprobs:
         all_logprobs = jnp.zeros((n_trajectories, max_len), dtype=jnp.float32)
     
-    def step_fn(carry, _):
+    def step_fn(carry, step_idx):
         """Single step of trajectory sampling."""
         state, all_states, all_parents, all_actions, all_action_indices, \
             all_masks_forward, all_masks_backward, trajectory_lengths, key_local = carry
-        
-        # Get current step index
-        step_idx = trajectory_lengths[0]  # All trajectories are at same step
         
         # Store parent state
         all_parents = all_parents.at[:, step_idx, :].set(state.positions)
@@ -703,12 +700,8 @@ def sample_trajectories_jax(
         masks_forward = get_mask_invalid_actions_forward_batch(
             state.positions, state.done, config
         )
-        masks_backward = get_mask_invalid_actions_backward_batch(
-            state.positions, state.done, config
-        )
         
         all_masks_forward = all_masks_forward.at[:, step_idx, :].set(masks_forward)
-        all_masks_backward = all_masks_backward.at[:, step_idx, :].set(masks_backward)
         
         # Get policy inputs
         states_policy = states2policy_jax(state.positions, config)
@@ -743,6 +736,12 @@ def sample_trajectories_jax(
         # Store state (after action)
         all_states = all_states.at[:, step_idx, :].set(new_positions)
         
+        # Compute backward mask for NEW state (s_{t+1})
+        masks_backward = get_mask_invalid_actions_backward_batch(
+            new_positions, new_done, config
+        )
+        all_masks_backward = all_masks_backward.at[:, step_idx, :].set(masks_backward)
+        
         # Update trajectory lengths (only for non-done trajectories)
         trajectory_lengths = jnp.where(~state.done, trajectory_lengths + 1, trajectory_lengths)
         
@@ -763,7 +762,7 @@ def sample_trajectories_jax(
     )
     
     # Use scan for efficiency
-    final_carry, _ = jax.lax.scan(step_fn, initial_carry, None, length=max_len)
+    final_carry, _ = jax.lax.scan(step_fn, initial_carry, jnp.arange(max_len))
     
     state, all_states, all_parents, all_actions, all_action_indices, \
         all_masks_forward, all_masks_backward, trajectory_lengths, key = final_carry

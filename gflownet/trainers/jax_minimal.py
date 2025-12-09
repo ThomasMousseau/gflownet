@@ -136,6 +136,8 @@ class JAXBatchConverter:
         rewards = self.pad_and_convert(rewards, self.max_states, name="rewards")
         
         logrewards = pytorch_batch.get_terminating_rewards(log=True, sort_by="trajectory")
+        # Clamp to avoid -inf which causes NaN loss
+        logrewards = torch.clamp(logrewards, min=-100.0)
         logrewards = self.pad_and_convert(logrewards, self.max_trajs, name="logrewards")
         
         logprobs_fwd, _ = pytorch_batch.get_logprobs(backward=False)
@@ -334,7 +336,9 @@ def convert_params_to_jax(agent, config, key, env=None):
     if agent is not None and agent.logZ is not None:
         jax_params["logZ"] = jnp.array(agent.logZ.detach().cpu().numpy(), dtype=jnp.float32)
     else:
-        jax_params["logZ"] = jnp.array(0.0, dtype=jnp.float32)
+        # Match PyTorch initialization: ones(z_dim) * 150.0 / 64
+        z_dim = config.gflownet.optimizer.z_dim
+        jax_params["logZ"] = jnp.ones(z_dim, dtype=jnp.float32) * 150.0 / 64.0
 
     return jax_params, jax_policies
 
@@ -533,12 +537,14 @@ def train_pure_jax(agent, config):
             logrewards_t = proxy.rewards(states_proxy_t, log=True)
 
         log_rewards_np = logrewards_t.detach().to("cpu").numpy().reshape(num_trajs)
+        # Clamp to avoid -inf which causes NaN loss
+        log_rewards_np = np.maximum(log_rewards_np, -100.0)
         return jnp.asarray(log_rewards_np, dtype=jnp.float32)
     
     # Loss function (will be JIT-compiled by jax_grad_step)
     def jax_loss_and_grad(params, states, parents, actions, action_indices, 
                          masks_forward, masks_backward, trajectory_indices, 
-                         actual_n_states, actual_n_trajs, log_rewards, loss_type=loss_type):
+                         actual_n_states, actual_n_trajs, actual_lengths, log_rewards, loss_type=loss_type):
         """Compute loss and gradients for pure JAX batch."""
         if loss_type == 'trajectorybalance':
             # Combine params into models
@@ -576,9 +582,15 @@ def train_pure_jax(agent, config):
             logprobs_b = logprobs_b_all[jnp.arange(batch_size), action_indices]
             
             # Create state mask (valid states only)
-            state_mask = jnp.arange(batch_size) < actual_n_states
-            logprobs_f = logprobs_f * state_mask
-            logprobs_b = logprobs_b * state_mask
+            # Note: states are flattened [traj0, traj1, ...] with padding at end of each traj
+            max_len = batch_size // actual_n_trajs
+            step_indices = jnp.arange(max_len)
+            mask_2d = step_indices[None, :] < actual_lengths[:, None]
+            state_mask = mask_2d.reshape(-1)
+            
+            # Use where to avoid 0 * -inf = nan
+            logprobs_f = jnp.where(state_mask, logprobs_f, 0.0)
+            logprobs_b = jnp.where(state_mask, logprobs_b, 0.0)
             
             # Sum logprobs per trajectory
             traj_indices = trajectory_indices
@@ -611,13 +623,14 @@ def train_pure_jax(agent, config):
     @partial(jit, static_argnames=['optimizer', 'loss_type', 'actual_n_states', 'actual_n_trajs'])
     def jax_grad_step(params, opt_state, states, parents, actions, action_indices,
                      masks_forward, masks_backward, trajectory_indices,
-                     actual_n_states, actual_n_trajs, log_rewards,
+                     actual_n_states, actual_n_trajs, actual_lengths, log_rewards,
                      optimizer, loss_type=loss_type):
         """JIT-compiled gradient step for pure JAX."""
+        
         loss_value, grads = value_and_grad(jax_loss_and_grad)(
             params, states, parents, actions, action_indices,
             masks_forward, masks_backward, trajectory_indices,
-            actual_n_states, actual_n_trajs, log_rewards, loss_type=loss_type
+            actual_n_states, actual_n_trajs, actual_lengths, log_rewards, loss_type=loss_type
         )
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
@@ -656,7 +669,7 @@ def train_pure_jax(agent, config):
                 jax_params, opt_state, 
                 batch.states, batch.parents, batch.actions, batch.action_indices,
                 batch.masks_forward, batch.masks_backward, batch.trajectory_indices,
-                batch.actual_n_states, batch.actual_n_trajs, log_rewards,
+                batch.actual_n_states, batch.actual_n_trajs, batch.actual_lengths, log_rewards,
                 optimizer, loss_type=loss_type
             )
         
