@@ -255,16 +255,22 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
             
             if wc_times:
                 wc_mean = np.mean(wc_times)
-                row[f"{fw} Wallclock (s)"] = wc_mean
+                wc_std = np.std(wc_times)
+                row[f"{fw} Wallclock Mean (s)"] = wc_mean
+                row[f"{fw} Wallclock Std (s)"] = wc_std
             else:
-                row[f"{fw} Wallclock (s)"] = np.nan
+                row[f"{fw} Wallclock Mean (s)"] = np.nan
+                row[f"{fw} Wallclock Std (s)"] = np.nan
                 wc_mean = np.nan
                 
             if log_times:
                 log_mean = np.mean(log_times)
-                row[f"{fw} Logged (s)"] = log_mean
+                log_std = np.std(log_times)
+                row[f"{fw} Logged Mean (s)"] = log_mean
+                row[f"{fw} Logged Std (s)"] = log_std
             else:
-                row[f"{fw} Logged (s)"] = np.nan
+                row[f"{fw} Logged Mean (s)"] = np.nan
+                row[f"{fw} Logged Std (s)"] = np.nan
                 log_mean = np.nan
             
             # Calculate Python overhead percentage: (wallclock - logged) / wallclock
@@ -401,8 +407,8 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
 if __name__ == "__main__":
 
     #! Neural Networks Experiments
-    #process_experiment_group("neural-nets", "exp_mlp", "nlayers_")
-    #process_experiment_group("neural-nets", "exp_mlp", "nhid_")
+    process_experiment_group("neural-nets", "exp_mlp", "nlayers_")
+    process_experiment_group("neural-nets", "exp_mlp", "nhid_")
     
     #! Environment Experiments
     process_experiment_group("environment", "exp_env", "length_")
