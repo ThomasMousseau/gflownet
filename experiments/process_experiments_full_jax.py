@@ -323,11 +323,26 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
     runs_df.to_csv(runs_csv_path, index=False)
     print(f"Saved detailed runs to {runs_csv_path}")
 
+    # Build a lookup for scaling factors: (run_id) -> (wallclock_time / logged_time)
+    # This ensures plot data is consistent with the CSV table totals
+    scale_factors = {}
+    for item in data:
+        if item["logged_time"] > 0:
+            scale_factors[item["id"]] = item["wallclock_time"] / item["logged_time"]
+        else:
+            scale_factors[item["id"]] = 1.0
+
     all_frames = []
     for item in data:
         h = item["history"].copy()
         h["Framework"] = item["framework"]
         h["Parameter"] = item["parameter"]
+        h["run_id"] = item["id"]
+        
+        # Scale the time metric so that sum matches wall-clock time
+        scale = scale_factors.get(item["id"], 1.0)
+        h[METRIC_NAME_COMBINED] = h[METRIC_NAME_COMBINED] * scale
+        
         all_frames.append(h)
         
     if not all_frames:
@@ -344,7 +359,7 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
     
     full_df[METRIC_NAME_SMOOTH] = (
         full_df
-        .groupby(["Parameter", "Framework"])[METRIC_NAME_COMBINED]
+        .groupby(["Parameter", "Framework", "run_id"])[METRIC_NAME_COMBINED]
         .transform(lambda s: s.rolling(window=WINDOW, min_periods=1).mean())
     )
     
@@ -363,9 +378,9 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
         errorbar=('ci', 95)
     )
     
-    plt.title(f"Training Speed Comparison: {group_name} (Full)\nPyTorch vs Full JAX")
+    plt.title(f"Training Speed Comparison: {group_name} (Full)\nPyTorch vs Full JAX (Wall-clock scaled)")
     plt.xlabel("Iteration")
-    plt.ylabel("Time per Iteration (s)")
+    plt.ylabel("Time per Iteration (s) - Wall-clock scaled")
     plt.yscale("log")
     
     output_plot_path = os.path.join(output_dir, f"training_curve_{filename_suffix}_full.png")
@@ -378,7 +393,7 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
 
     truncated_df[METRIC_NAME_SMOOTH] = (
         truncated_df
-        .groupby(["Parameter", "Framework"])[METRIC_NAME_COMBINED]
+        .groupby(["Parameter", "Framework", "run_id"])[METRIC_NAME_COMBINED]
         .transform(lambda s: s.rolling(window=WINDOW, min_periods=1).mean())
     )
     
@@ -395,9 +410,9 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
         palette="viridis"
     )
     
-    plt.title(f"Training Speed Comparison: {group_name} (Truncated to {min_max_step} steps)\nPyTorch vs Full JAX")
+    plt.title(f"Training Speed Comparison: {group_name} (Truncated to {min_max_step} steps)\nPyTorch vs Full JAX (Wall-clock scaled)")
     plt.xlabel("Iteration")
-    plt.ylabel("Time per Iteration (s)")
+    plt.ylabel("Time per Iteration (s) - Wall-clock scaled")
     plt.yscale("log")
     
     output_plot_path = os.path.join(output_dir, f"training_curve_{filename_suffix}_truncated.png")
