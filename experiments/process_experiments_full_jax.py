@@ -230,81 +230,7 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
     
     filename_suffix = param_prefix.rstrip("_")
 
-    # ========== HELPER FUNCTION FOR TABLE GENERATION ==========
-    def generate_table(data, time_key, table_name):
-        """Generate a summary table using the specified time metric."""
-        df_rows = []
-        grouped_data = defaultdict(lambda: defaultdict(list))
-        
-        for item in data:
-            grouped_data[item["parameter"]][item["framework"]].append(item[time_key])
-
-        try:
-            sorted_params = sorted(grouped_data.keys(), key=lambda x: float(x))
-        except ValueError:
-            sorted_params = sorted(grouped_data.keys())
-
-        all_frameworks = set()
-        for item in data:
-            all_frameworks.add(item["framework"])
-        all_frameworks = sorted(list(all_frameworks))
-
-        for param in sorted_params:
-            frameworks = grouped_data[param]
-            row = {"Parameter": param}
-            
-            pytorch_mean = None
-            jax_mean = None
-            
-            for fw in all_frameworks:
-                times = frameworks.get(fw, [])
-                if times:
-                    mean = np.mean(times)
-                    std = np.std(times)
-                    row[f"{fw} Mean (s)"] = mean
-                    row[f"{fw} Std (s)"] = std
-                    
-                    # Track means for ratio calculation
-                    if fw == "PyTorch":
-                        pytorch_mean = mean
-                    elif fw == "Full JAX":
-                        jax_mean = mean
-                else:
-                    row[f"{fw} Mean (s)"] = np.nan
-                    row[f"{fw} Std (s)"] = np.nan
-            
-            # Calculate speedup ratio (PyTorch / JAX)
-            if pytorch_mean is not None and jax_mean is not None and jax_mean > 0:
-                row["Speedup (PyTorch/JAX)"] = pytorch_mean / jax_mean
-            else:
-                row["Speedup (PyTorch/JAX)"] = np.nan
-            
-            df_rows.append(row)
-        
-        return pd.DataFrame(df_rows)
-
-    # ========== TABLE 1: WALL-CLOCK TIME ==========
-    df_wallclock = generate_table(data, "wallclock_time", "Wall-clock")
-    wallclock_csv_path = os.path.join(output_dir, f"results_{filename_suffix}_wallclock.csv")
-    df_wallclock.to_csv(wallclock_csv_path, index=False)
-    print(f"Saved wall-clock table to {wallclock_csv_path}")
-    
-    print(f"\n{group_name} - Wall-clock Time (includes all overhead):")
-    print(df_wallclock.to_string(index=False))
-    print()
-
-    # ========== TABLE 2: LOGGED TIME (time_epoch / time_train+time_sample) ==========
-    df_logged = generate_table(data, "logged_time", "Logged")
-    logged_csv_path = os.path.join(output_dir, f"results_{filename_suffix}_logged.csv")
-    df_logged.to_csv(logged_csv_path, index=False)
-    print(f"Saved logged time table to {logged_csv_path}")
-    
-    print(f"\n{group_name} - Logged Time (time_epoch for JAX, time_train+time_sample for PyTorch):")
-    print(df_logged.to_string(index=False))
-    print()
-    
     # ========== COMBINED SUMMARY TABLE ==========
-    # Show both metrics side by side for easy comparison
     df_combined_rows = []
     
     try:
@@ -322,20 +248,31 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
     for param in sorted_params:
         row = {"Parameter": param}
         
-        # Wall-clock times
+        # Wall-clock and logged times for each framework
         for fw in ["PyTorch", "Full JAX"]:
             wc_times = grouped_wallclock[param].get(fw, [])
             log_times = grouped_logged[param].get(fw, [])
             
             if wc_times:
-                row[f"{fw} Wallclock (s)"] = np.mean(wc_times)
+                wc_mean = np.mean(wc_times)
+                row[f"{fw} Wallclock (s)"] = wc_mean
             else:
                 row[f"{fw} Wallclock (s)"] = np.nan
+                wc_mean = np.nan
                 
             if log_times:
-                row[f"{fw} Logged (s)"] = np.mean(log_times)
+                log_mean = np.mean(log_times)
+                row[f"{fw} Logged (s)"] = log_mean
             else:
                 row[f"{fw} Logged (s)"] = np.nan
+                log_mean = np.nan
+            
+            # Calculate Python overhead percentage: (wallclock - logged) / wallclock
+            if wc_mean and log_mean and not np.isnan(wc_mean) and not np.isnan(log_mean) and wc_mean > 0:
+                overhead = (wc_mean - log_mean) / wc_mean
+                row[f"{fw} Python Overhead (%)"] = overhead * 100
+            else:
+                row[f"{fw} Python Overhead (%)"] = np.nan
         
         # Speedup ratios
         pt_wc = grouped_wallclock[param].get("PyTorch", [])
@@ -356,33 +293,13 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
         df_combined_rows.append(row)
     
     df_combined = pd.DataFrame(df_combined_rows)
-    combined_csv_path = os.path.join(output_dir, f"results_{filename_suffix}_combined.csv")
+    combined_csv_path = os.path.join(output_dir, f"results_{filename_suffix}.csv")
     df_combined.to_csv(combined_csv_path, index=False)
-    print(f"Saved combined table to {combined_csv_path}")
+    print(f"Saved results to {combined_csv_path}")
     
-    print(f"\n{group_name} - Combined Summary (Wallclock vs Logged Time):")
+    print(f"\n{group_name} - Summary (Wallclock vs Logged Time with Python Overhead):")
     print(df_combined.to_string(index=False))
     print()
-    
-    # Save detailed runs table for debugging
-    runs_df_rows = []
-    for item in data:
-        runs_df_rows.append({
-            "Run ID": item["id"],
-            "Run Name": item["name"],
-            "Framework": item["framework"],
-            "Parameter": item["parameter"],
-            "Wallclock Time (s)": item["wallclock_time"],
-            "Logged Time (s)": item["logged_time"],
-            "Max Step": item["max_step"],
-            "N Logged Points": item["n_logged_points"],
-            "Was Estimated": item["was_estimated"],
-        })
-    
-    runs_df = pd.DataFrame(runs_df_rows)
-    runs_csv_path = os.path.join(output_dir, f"results_{filename_suffix}_runs.csv")
-    runs_df.to_csv(runs_csv_path, index=False)
-    print(f"Saved detailed runs to {runs_csv_path}")
 
     # Build a lookup for scaling factors: (run_id) -> (wallclock_time / logged_time)
     # This ensures plot data is consistent with the CSV table totals
