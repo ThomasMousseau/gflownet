@@ -422,7 +422,7 @@ def train(agent, config):
         return jax_params, opt_state, key, all_metrics, all_log_rewards
 
     # Training loop
-    steps_per_epoch = 10
+    steps_per_epoch = 10 #! I HAVE TO CHANGE THIS
     n_epochs = (n_train_steps - start_it + 1) // steps_per_epoch
     
     pbar = tqdm(
