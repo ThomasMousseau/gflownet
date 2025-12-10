@@ -9,9 +9,8 @@ from collections import defaultdict
 
 WANDB_ENTITY = "fatty_data" 
 WANDB_PROJECT = "GFlowNet-Experiments" 
-METRIC_NAME = "Trajectory lengths mean"
-METRIC_NAME_SMOOTH = "Trajectory lengths mean smooth"
-TIME_NAME = "time_train"               # time metric in WandB
+METRIC_NAME = "time_train"
+METRIC_NAME_SMOOTH = "time_train_smooth"
 TARGET_STEPS = 5000 
 WINDOW = 20
 
@@ -25,54 +24,58 @@ EXPERIMENT_GROUPS = {
 TAG_JAX = "JAX"
 TAG_TORCH = "PyTorch"
 
-
 def get_runs(api, project_path, group_tag):
+    """
+    Fetch runs from WandB that match the group tag.
+    """
     filters = {
         "tags": {"$in": [group_tag]},
         "state": "finished" 
     }
-    return api.runs(project_path, filters=filters)
-
+    runs = api.runs(project_path, filters=filters)
+    return runs
 
 def get_run_partially_failed(api, project_path, group_tag):
     filters = {
         "tags": {"$in": [group_tag]},
-        "state": {"$in": ["finished", "crashed"]}
+        "state": {"$in": ["finished", "crashed", "killed"]}
     }
-    return api.runs(project_path, filters=filters)
+    runs = api.runs(project_path, filters=filters)
+    return runs
 
 
 def estimate_total_time(history, target_steps=5000, window=500):
     """
     Estimate total training time based on logged history.
-    Uses TIME_NAME ('time_train') as the per-iteration (or per-logging-point) time.
+    If the run has not reached target_steps, estimate the remaining time
+    using the average time per iteration from the last `window` logged points.
+    Returns:
+        estimated_total_time (float): Estimated total training time.
+        actual_total_time (float): Actual logged training time.
+        max_step (int): Maximum step reached in the run.
+        was_estimated (bool): Whether the total time was estimated due to crash.
     """
-    if history.empty or '_step' not in history or TIME_NAME not in history:
+    if history.empty or '_step' not in history or METRIC_NAME not in history:
         return 0, 0, 0, False
     
-    # keep only rows with a valid time value
-    valid_history = history.dropna(subset=[TIME_NAME]).sort_values('_step')
+    valid_history = history.dropna(subset=[METRIC_NAME]).sort_values('_step')
+    
     if valid_history.empty:
         return 0, 0, 0, False
-
+    
     max_step = int(valid_history['_step'].max())
-
-    # If time_train is per-iteration time, summing makes sense.
-    # If it's cumulative wall-time, you might want `.iloc[-1]` instead.
-    actual_total = valid_history[TIME_NAME].sum()
-
-    # Run reached target_steps → no need to estimate
+    actual_total = valid_history[METRIC_NAME].sum()
+    
     if max_step >= target_steps:
         return actual_total, actual_total, max_step, False
     
-    # Use last `window` points to estimate remaining time
     cutoff_step = max_step - window
     recent_history = valid_history[valid_history['_step'] > cutoff_step]
     
     if not recent_history.empty:
-        avg_time_per_iter = recent_history[TIME_NAME].mean()
+        avg_time_per_iter = recent_history[METRIC_NAME].mean()
     else:
-        avg_time_per_iter = valid_history[TIME_NAME].mean()
+        avg_time_per_iter = valid_history[METRIC_NAME].mean()
         
     n_logged_points = len(valid_history)
     if n_logged_points > 1:
@@ -109,20 +112,18 @@ def parse_run_info(run, param_prefix):
     if not framework or param_value is None:
         return None
 
-    # 🔥 Fetch BOTH metrics + step from WandB
-    history_table = run.history(
-        samples=5000,
-        keys=[METRIC_NAME, TIME_NAME, "_step"]
-    )
-    history_graph = run.history(
-        samples=500,
-        keys=[METRIC_NAME, TIME_NAME, "_step"]
-    )
+    history_table = run.history(samples=5000,keys=[METRIC_NAME, "_step"]) #! alaways retuns 500 points
+    history_graph = run.history(samples=500, keys=[METRIC_NAME, "_step"]) 
     
-    # Calculate total training time based on time_train
+    
+    # Calculate total time (estimated if crashed)
     estimated_total, actual_total, max_step, was_estimated = estimate_total_time(
         history_table, target_steps=TARGET_STEPS
     )
+    
+    # if was_estimated:
+    #     print(f"  [Estimate] Run {run.name}: crashed at step {max_step}, "
+    #           f"actual={actual_total:.2f}s, estimated={estimated_total:.2f}s")
 
     return {
         "id": run.id,
@@ -130,12 +131,11 @@ def parse_run_info(run, param_prefix):
         "framework": framework,
         "parameter": param_value,
         "history": history_graph,
-        "total_time": estimated_total,
+        "total_time": estimated_total,  # Use estimated total for table
         "actual_time": actual_total,
         "max_step": max_step,
         "was_estimated": was_estimated
     }
-
 
 def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_experiments=False):
     print(f"Processing group: {group_name} (Tag: {exp_tag}, Param: {param_prefix})")
@@ -173,7 +173,10 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
     except ValueError:
         sorted_params = sorted(grouped_data.keys())
 
-    all_frameworks = sorted({item["framework"] for item in data})
+    all_frameworks = set()
+    for item in data:
+        all_frameworks.add(item["framework"])
+    all_frameworks = sorted(list(all_frameworks))
 
     for param in sorted_params:
         frameworks = grouped_data[param]
@@ -197,7 +200,6 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
     df_table.to_csv(output_csv_path, index=False)
     print(f"Saved table to {output_csv_path}")
 
-    # ========== MERGE ALL HISTORIES ==========
     all_frames = []
     for item in data:
         h = item["history"].copy()
@@ -208,21 +210,29 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
     if not all_frames:
         return
 
-    full_df = pd.concat(all_frames, ignore_index=True)
+    full_df = pd.concat(all_frames)
     
     try:
         full_df["Parameter"] = pd.to_numeric(full_df["Parameter"])
     except ValueError:
         pass
+
+    min_max_step = min(item["max_step"] for item in data)
     
-    # ========== PLOT 1: Trajectory length vs step ==========
+    full_df["time_train_smooth"] = (
+        full_df
+        .groupby(["Parameter", "Framework"])[METRIC_NAME]
+        .transform(lambda s: s.rolling(window=WINDOW, min_periods=1).mean())
+    )
+    
+    # ========== PLOT 1: FULL PLOT (0 to 5000) ==========
     plt.figure(figsize=(12, 8))
     sns.set_style("whitegrid")
     
     sns.lineplot(
         data=full_df,
         x="_step",
-        y=METRIC_NAME,
+        y=METRIC_NAME_SMOOTH,
         hue="Parameter",
         style="Framework",
         markers=False,
@@ -230,45 +240,64 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
         errorbar=('ci', 95)
     )
     
-    plt.title(f"Trajectory Length Comparison: {group_name} (Full)")
+    plt.title(f"Training Speed Comparison: {group_name} (Full)")
     plt.xlabel("Iteration")
-    plt.ylabel("Trajectory Length Mean")
+    plt.ylabel("Time per Iteration (s)")
+    plt.yscale("log")
     
     output_plot_path = os.path.join("experiments", group_name, f"training_curve_{filename_suffix}_full.png")
     plt.savefig(output_plot_path)
     plt.close()
     print(f"Saved full plot to {output_plot_path}")
 
-    # ========== PLOT 2: TIME vs TRAJECTORY LENGTH ==========
+    # ========== PLOT 2: TRUNCATED PLOT (0 to min_max_step) ==========
+    truncated_df = full_df[full_df["_step"] <= min_max_step]
+
+    truncated_df["time_train_smooth"] = (
+        truncated_df
+        .groupby(["Parameter", "Framework"])[METRIC_NAME]
+        .transform(lambda s: s.rolling(window=WINDOW, min_periods=1).mean())
+    )
+    
     plt.figure(figsize=(12, 8))
     sns.set_style("whitegrid")
-
-    # Scatter plot (one point per logging step)
-    sns.scatterplot(
-        data=full_df.dropna(subset=[METRIC_NAME, TIME_NAME]),
-        x=METRIC_NAME,
-        y=TIME_NAME,
-        hue="Framework",
-        style="Parameter",
-        alpha=0.4,
-        s=30
+    
+    sns.lineplot(
+        data=truncated_df,
+        x="_step",
+        y=METRIC_NAME_SMOOTH,
+        hue="Parameter",
+        style="Framework",
+        markers=False,
+        palette="viridis"
     )
-
-    plt.title(f"Time per Iteration vs Trajectory Length — {group_name}")
-    plt.xlabel("Mean Trajectory Length")
+    
+    plt.title(f"Training Speed Comparison: {group_name} (Truncated to {min_max_step} steps)")
+    plt.xlabel("Iteration")
     plt.ylabel("Time per Iteration (s)")
     plt.yscale("log")
-
-    output_path = os.path.join(
-        "experiments", group_name, f"time_vs_length_{filename_suffix}.png"
-    )
-    plt.savefig(output_path)
+    
+    output_plot_path = os.path.join("experiments", group_name, f"training_curve_{filename_suffix}_truncated.png")
+    plt.savefig(output_plot_path)
     plt.close()
-
-    print(f"Saved plot: {output_path}")
-
+    print(f"Saved truncated plot to {output_plot_path} (truncated at step {min_max_step})")
 
 if __name__ == "__main__":
 
-    process_experiment_group("environment", "exp_env", "padding_", has_failed_experiments=True)
-    #process_experiment_group("environment", "exp_env", "length_", has_failed_experiments=True)
+    #! Neural Networks Experiments
+    #process_experiment_group("neural-nets", "exp_mlp", "nlayers_", has_failed_experiments=True)
+    process_experiment_group("neural-nets", "exp_mlp", "nhid_")
+    
+    #! Environment Experiments
+    # process_experiment_group("environment", "exp_env", "length_", has_failed_experiments=True)
+    # process_experiment_group("environment", "exp_env", "dim_", has_failed_experiments=True)
+    # process_experiment_group("environment", "exp_env", "env_")
+    
+    #! Hyperparameters Experiments
+    #process_experiment_group("hyperparameters", "exp_hyperparam", "batchsize_")
+    #process_experiment_group("hyperparameters", "exp_hyperparam", "trajectory_")
+    
+    #! Hardware Experiments
+    #process_experiment_group("hardware", "exp_hardware", "hardware_", has_failed_experiments=True)
+    
+    

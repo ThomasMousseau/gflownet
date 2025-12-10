@@ -6,12 +6,14 @@ from jax import jit, value_and_grad, grad
 import equinox as eqx
 import optax
 import gc
+from collections import defaultdict
 from tqdm import tqdm
 from gflownet.utils.common import instantiate
 from gflownet.utils.policy import parse_policy_config
 from gflownet.envs.grid_jax import (
     sample_trajectories_jax,
     states2proxy_jax,
+    states2policy_jax,
 )
 
 
@@ -404,30 +406,57 @@ def train(agent, config):
                 log_rewards,
                 optimizer, loss_type
             )
-            return (new_p, new_o), l
+            return (new_p, new_o), (l, g)
             
         if ttsr == 1:
-            (jax_params, opt_state), loss = update_body((jax_params, opt_state), None)
+            (jax_params, opt_state), (loss, grads) = update_body((jax_params, opt_state), None)
             step_losses = jnp.reshape(loss, (1,))
         else:
-            (jax_params, opt_state), step_losses = jax.lax.scan(
+            (jax_params, opt_state), (step_losses, grads) = jax.lax.scan(
                 update_body, (jax_params, opt_state), None, length=ttsr
             )
         
-        return jax_params, opt_state, key, jnp.mean(step_losses), log_rewards
+        # Compute gradient metrics
+        grad_logZ_mean = jnp.mean(grads['logZ']) if grads['logZ'] is not None else 0.0
+        
+        # Compute first layer gradient norm for forward policy
+        first_layer_grad_norm = 0.0
+        if grads['forward_policy_trainable'] is not None:
+            # Get first layer weights from the pytree
+            leaves = jax.tree_util.tree_leaves(grads['forward_policy_trainable'])
+            if len(leaves) > 0:
+                first_layer_grad_norm = jnp.sqrt(jnp.sum(leaves[0] ** 2))
+        
+        # Trajectory length stats
+        traj_lengths = batch.actual_lengths
+        traj_len_mean = jnp.mean(traj_lengths)
+        traj_len_min = jnp.min(traj_lengths)
+        traj_len_max = jnp.max(traj_lengths)
+        
+        # Pack metrics
+        metrics = {
+            'loss': jnp.mean(step_losses),
+            'traj_len_mean': traj_len_mean,
+            'traj_len_min': traj_len_min,
+            'traj_len_max': traj_len_max,
+            'grad_logZ_mean': grad_logZ_mean,
+            'first_layer_grad_norm': first_layer_grad_norm,
+        }
+        
+        return jax_params, opt_state, key, metrics, log_rewards
 
     @jit
     def train_epoch(jax_params, opt_state, key):
         """Run a chunk of training steps fully JIT-compiled using scan."""
         def body_fn(carry, _):
             params, opt, k = carry
-            new_params, new_opt, new_k, loss, log_rewards = train_step(params, opt, k)
-            return (new_params, new_opt, new_k), (loss, log_rewards)
+            new_params, new_opt, new_k, metrics, log_rewards = train_step(params, opt, k)
+            return (new_params, new_opt, new_k), (metrics, log_rewards)
 
-        (jax_params, opt_state, key), (losses, all_log_rewards) = jax.lax.scan(
+        (jax_params, opt_state, key), (all_metrics, all_log_rewards) = jax.lax.scan(
             body_fn, (jax_params, opt_state, key), None, length=steps_per_epoch
         )
-        return jax_params, opt_state, key, losses, all_log_rewards
+        return jax_params, opt_state, key, all_metrics, all_log_rewards
 
     # Training loop
     steps_per_epoch = 10
@@ -443,13 +472,20 @@ def train(agent, config):
         t0 = time.time()
         
         # Run JIT epoch
-        jax_params, opt_state, key, losses, all_log_rewards = train_epoch(jax_params, opt_state, key)
+        jax_params, opt_state, key, all_metrics, all_log_rewards = train_epoch(jax_params, opt_state, key)
         
         t1 = time.time()
         
-        # Metrics
-        avg_loss = float(jnp.mean(losses))
+        # Metrics (aggregate over steps in epoch)
+        avg_loss = float(jnp.mean(all_metrics['loss']))
         current_step = start_it + (epoch + 1) * steps_per_epoch
+        
+        # Compute current learning rates from schedules
+        lr_main = float(lr_schedule_main(current_step))
+        lr_logz = float(lr_schedule_logz(current_step))
+        
+        # Get current logZ value
+        logZ_value = float(jnp.sum(jax_params['logZ']))
         
         # Logging
         if evaluator.should_log_train(current_step):
@@ -457,7 +493,22 @@ def train(agent, config):
                 "step": current_step,
                 "time_epoch": t1 - t0,
                 "steps_per_sec": steps_per_epoch / (t1 - t0),
-                "all": avg_loss
+                # Loss
+                "Loss": avg_loss,
+                "all": avg_loss,
+                # Trajectory stats (mean over epoch)
+                "Trajectory lengths mean": float(jnp.mean(all_metrics['traj_len_mean'])),
+                "Trajectory lengths min": float(jnp.min(all_metrics['traj_len_min'])),
+                "Trajectory lengths max": float(jnp.max(all_metrics['traj_len_max'])),
+                # Batch info
+                "Batch size": n_trajs_total,
+                # LogZ and learning rates
+                "logZ": logZ_value,
+                "Learning rate": lr_main,
+                "Learning rate logZ": lr_logz,
+                # Gradient metrics (mean over epoch)
+                "grad_logZ_mean": float(jnp.mean(all_metrics['grad_logZ_mean'])),
+                "first_layer_grad_norm": float(jnp.mean(all_metrics['first_layer_grad_norm'])),
             }
             logger.log_metrics(metrics, step=current_step, use_context=use_context)
             
@@ -475,9 +526,166 @@ def train(agent, config):
         pbar.update(steps_per_epoch - 1)
         
         # Evaluation (if needed)
-        if agent is not None and evaluator.should_eval(current_step):
-            # Note: Evaluation might still be slow/PyTorch-based
-            evaluator.eval_and_log(current_step)
+        if evaluator.should_eval(current_step):
+            # Sample for evaluation
+            key, eval_key = jax.random.split(key)
+            
+            # Reconstruct model for sampling
+            if 'forward_policy_trainable' in jax_params and jax_params['forward_policy_trainable'] is not None:
+                model_f_eval = eqx.combine(jax_params['forward_policy_trainable'], jax_policies['forward_static'])
+            else:
+                model_f_eval = jax_policies['forward'].model
+            
+            # Sample trajectories for evaluation (with logprobs for additional metrics)
+            n_eval_samples = config.evaluator.get('n', 1000)
+            eval_batch, _ = sample_trajectories_jax(
+                key=eval_key,
+                config=grid_config,
+                policy_model=model_f_eval,
+                n_trajectories=n_eval_samples,
+                temperature=1.0,
+                return_logprobs=True  # Need logprobs for metrics
+            )
+            
+            # Extract terminal states
+            eval_lengths = eval_batch.actual_lengths
+            num_eval_trajs = eval_lengths.shape[0]
+            max_eval_len = eval_batch.states.shape[0] // num_eval_trajs
+            eval_states_reshaped = eval_batch.states.reshape(num_eval_trajs, max_eval_len, -1)
+            last_eval_indices = jnp.clip(eval_lengths - 1, 0, max_eval_len - 1)
+            terminal_states_eval = eval_states_reshaped[jnp.arange(num_eval_trajs), last_eval_indices]
+            
+            # Convert to numpy for plotting
+            x_sampled = np.array(terminal_states_eval)
+            
+            # Compute density metrics if we have all states test buffer
+            eval_metrics = {}
+            if hasattr(env, 'get_all_terminating_states'):
+                # Get all terminating states
+                all_states = env.get_all_terminating_states()
+                x_tt = np.array(all_states)
+                
+                # Compute true rewards (density)
+                x_tt_proxy = (x_tt / (grid_config.length - 1)) * 2.0 - 1.0
+                
+                # Compute rewards using JAX corners function
+                rewards = np.exp(np.array(corners_reward_jax(
+                    jnp.array(x_tt_proxy), proxy_mu, proxy_sigma, proxy_n_dim
+                )))
+                z_true = rewards.sum()
+                density_true = rewards / z_true
+                
+                # Compute predicted density from samples histogram
+                hist = defaultdict(int)
+                for x in x_sampled:
+                    hist[tuple(x.tolist())] += 1
+                z_pred = sum([hist[tuple(x.tolist())] for x in x_tt]) + 1e-9
+                density_pred = np.array([hist[tuple(x.tolist())] / z_pred for x in x_tt])
+                
+                log_density_true = np.log(density_true + 1e-8)
+                log_density_pred = np.log(density_pred + 1e-8)
+                
+                # ==================== DENSITY METRICS ====================
+                # L1 error
+                l1 = np.abs(density_pred - density_true).mean()
+                # KL divergence
+                kl = (density_true * (log_density_true - log_density_pred)).mean()
+                # Jensen-Shannon divergence
+                log_mean_dens = np.logaddexp(log_density_true, log_density_pred) + np.log(0.5)
+                jsd_val = 0.5 * np.sum(density_true * (log_density_true - log_mean_dens))
+                jsd_val += 0.5 * np.sum(density_pred * (log_density_pred - log_mean_dens))
+                
+                eval_metrics["L1 error"] = l1
+                eval_metrics["KL Div."] = kl
+                eval_metrics["Jensen Shannon Div."] = jsd_val
+                
+                # ==================== LOG-PROB METRICS ====================
+                # Compute log probabilities for sampled trajectories
+                # We need to recompute log probs using the policy on the sampled states
+                
+                # Get sampled terminal states rewards
+                x_sampled_proxy = (x_sampled / (grid_config.length - 1)) * 2.0 - 1.0
+                sampled_rewards = np.exp(np.array(corners_reward_jax(
+                    jnp.array(x_sampled_proxy), proxy_mu, proxy_sigma, proxy_n_dim
+                )))
+                
+                # Compute log probs for each trajectory
+                # Vectorized approach: compute all log probs at once
+                eval_states_flat = eval_batch.states  # [n_trajs * max_len, n_dim]
+                eval_actions_flat = eval_batch.action_indices  # [n_trajs * max_len]
+                eval_masks_flat = eval_batch.masks_forward  # [n_trajs * max_len, n_actions]
+                
+                # Convert all states to policy format
+                all_states_policy = states2policy_jax(eval_states_flat, grid_config)
+                
+                # Get logits for all states using vmap
+                all_logits = jax.vmap(model_f_eval)(all_states_policy)
+                
+                # Apply masks and compute log probs
+                all_logits_masked = jnp.where(eval_masks_flat, -1e10, all_logits)
+                all_log_probs = jax.nn.log_softmax(all_logits_masked, axis=1)
+                
+                # Get log prob of taken action for each state
+                n_states_total = eval_states_flat.shape[0]
+                action_log_probs = all_log_probs[jnp.arange(n_states_total), eval_actions_flat]
+                
+                # Reshape to [n_trajs, max_len]
+                action_log_probs_2d = action_log_probs.reshape(num_eval_trajs, max_eval_len)
+                
+                # Create mask for valid steps
+                step_indices = np.arange(max_eval_len)[None, :]
+                valid_mask = step_indices < np.array(eval_lengths)[:, None]
+                
+                # Zero out padding and sum per trajectory
+                action_log_probs_2d = np.where(valid_mask, np.array(action_log_probs_2d), 0.0)
+                traj_log_probs = action_log_probs_2d.sum(axis=1)
+                
+                # NLL of test data (negative log likelihood)
+                nll_tt = -traj_log_probs.mean()
+                eval_metrics["NLL of test data"] = float(nll_tt)
+                
+                # Bootstrap std of log probs (simplified - using trajectory variance)
+                logprobs_std = np.std(traj_log_probs)
+                eval_metrics["Mean BS Std(logp)"] = float(logprobs_std)
+                
+                # Std of probs
+                probs = np.exp(np.clip(traj_log_probs, -50, 0))  # Clip to avoid overflow
+                probs_std = np.std(probs)
+                eval_metrics["Mean BS Std(p)"] = float(probs_std)
+                
+                # Correlation between trajectory probs and rewards
+                if len(sampled_rewards) > 1 and np.std(sampled_rewards) > 1e-10:
+                    corr = np.corrcoef(probs, sampled_rewards)[0, 1]
+                    if not np.isnan(corr):
+                        eval_metrics["Corr. (test probs., rewards)"] = float(corr)
+                
+                # Variance of (log rewards - log probs)
+                log_rewards = np.log(sampled_rewards + 1e-8)
+                var_logrewards_logp = np.var(log_rewards - traj_log_probs)
+                eval_metrics["Var(logR - logp) test"] = float(var_logrewards_logp)
+                
+                # Ratio of logprobs std to NLL
+                if abs(nll_tt) > 1e-10:
+                    logprobs_std_nll_ratio = logprobs_std / abs(nll_tt)
+                    eval_metrics["BS Std(logp) / NLL"] = float(logprobs_std_nll_ratio)
+                
+                logger.log_metrics(eval_metrics, step=current_step, use_context=use_context)
+                
+                # Plot reward samples
+                if hasattr(env, 'plot_reward_samples'):
+                    fig = env.plot_reward_samples(
+                        x_sampled_proxy,
+                        x_tt_proxy,
+                        rewards,
+                    )
+                    if fig is not None:
+                        logger.log_plots(
+                            {"True reward and GFlowNet samples": fig},
+                            step=current_step,
+                            use_context=use_context
+                        )
+                
+                print(f"\n[Eval @ step {current_step}] L1: {l1:.4f}, KL: {kl:.4f}, JSD: {jsd_val:.4f}, NLL: {nll_tt:.4f}")
             
         # Periodic GC
         if epoch % 10 == 0:

@@ -13,6 +13,9 @@ from typing import List, Tuple, Optional
 import jax
 import jax.numpy as jnp
 import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.axes import Axes
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 from jax import jit, vmap
 
 
@@ -577,6 +580,129 @@ class GridJAX:
         self.state = list(state)
         self.done = done
         return self
+
+    def get_all_terminating_states(self):
+        """
+        Returns all possible terminating states (all grid positions).
+        
+        For a grid of dimensions n_dim and length L, this returns all L^n_dim
+        possible states as a list of lists.
+        
+        Returns
+        -------
+        List[List[int]]
+            All possible terminating states on the grid.
+        """
+        import itertools
+        all_states = list(itertools.product(range(self.length), repeat=self.n_dim))
+        return [list(s) for s in all_states]
+
+    def plot_reward_samples(
+        self,
+        samples,
+        samples_reward,
+        rewards,
+        dpi: int = 150,
+        n_ticks_max: int = 50,
+        reward_norm: bool = True,
+        **kwargs,
+    ):
+        """
+        Plots the reward density as a 2D histogram on the grid, alongside a histogram
+        representing the samples density.
+
+        It is assumed that the rewards correspond to entire domain of the grid and are
+        sorted from left to right (first) and top to bottom of the grid of samples.
+
+        Parameters
+        ----------
+        samples : array-like
+            A batch of samples from the GFlowNet policy in proxy format. These samples
+            will be plotted on top of the reward density.
+        samples_reward : array-like
+            A batch of samples containing a grid over the sample space, from which the
+            reward has been obtained. Ignored by this method.
+        rewards : array-like
+            The rewards of samples_reward. It should be a vector of dimensionality
+            length ** 2 and be sorted such that the each block at rewards[i *
+            length:i * length + length] correspond to the rewards at the i-th
+            row of the grid of samples, from top to bottom.
+        dpi : int
+            Dots per inch, indicating the resolution of the plot.
+        n_ticks_max : int
+            Maximum of number of ticks to include in the axes.
+        reward_norm : bool
+            Whether to normalize the histogram. True by default.
+        """
+        # Only available for 2D grids
+        if self.n_dim != 2:
+            return None
+        
+        # Convert to numpy if needed
+        if isinstance(samples, jnp.ndarray):
+            samples = np.array(samples)
+        elif hasattr(samples, 'numpy'):  # torch tensor
+            samples = samples.numpy()
+        else:
+            samples = np.array(samples)
+            
+        if isinstance(rewards, jnp.ndarray):
+            rewards = np.array(rewards)
+        elif hasattr(rewards, 'numpy'):  # torch tensor
+            rewards = rewards.numpy()
+        else:
+            rewards = np.array(rewards)
+            
+        assert rewards.shape[0] == self.length**2
+        
+        # Init figure
+        fig, axes = plt.subplots(ncols=2, dpi=dpi)
+        step_ticks = np.ceil(self.length / n_ticks_max).astype(int)
+        
+        # 2D histogram of samples
+        samples_hist, xedges, yedges = np.histogram2d(
+            samples[:, 0], samples[:, 1], bins=(self.length, self.length), density=True
+        )
+        # Transpose and reverse rows so that [0, 0] is at bottom left
+        samples_hist = samples_hist.T[::-1, :]
+        
+        # Normalize and reshape reward into a grid with [0, 0] at the bottom left
+        if reward_norm:
+            rewards = rewards / rewards.sum()
+        rewards_2d = rewards.reshape(self.length, self.length).T[::-1, :]
+        
+        # Plot reward
+        self._plot_grid_2d(rewards_2d, axes[0], step_ticks, title="True reward")
+        # Plot samples histogram
+        self._plot_grid_2d(samples_hist, axes[1], step_ticks, title="Samples density")
+        fig.tight_layout()
+        return fig
+
+    @staticmethod
+    def _plot_grid_2d(img: np.ndarray, ax: Axes, step_ticks: int, title: str):
+        """
+        Plots a 2D histogram of a grid environment as an image.
+
+        Parameters
+        ----------
+        img : np.ndarray
+            An array containing a 2D histogram over a grid.
+        ax : Axes
+            A matplotlib Axes object on which the image will be plotted.
+        step_ticks : int
+            The step value to add ticks to the axes. For example, if it is 2, the ticks
+            will be at 0, 2, 4, ...
+        title : str
+            Title for the axes.
+        """
+        ax_img = ax.imshow(img)
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("top", size="5%", pad=0.05)
+        ax.set_xticks(np.arange(start=0, stop=img.shape[0], step=step_ticks))
+        ax.set_yticks(np.arange(start=0, stop=img.shape[1], step=step_ticks)[::-1])
+        cax.set_title(title)
+        plt.colorbar(ax_img, cax=cax, orientation="horizontal")
+        cax.xaxis.set_ticks_position("top")
 
 
 # ==============================================================================

@@ -286,7 +286,8 @@ if __name__ == "__main__":
 
     #! Neural Networks Experiments
     #process_experiment_group("neural-nets", "exp_mlp", "nlayers_", has_failed_experiments=True)
-    process_experiment_group("neural-nets", "exp_mlp", "nhid_")
+    #process_experiment_group("neural-nets", "exp_mlp", "nhid_")
+    process_experiment_group("neural-nets", "exp_mlp", "nhid_", full_jax_vs_torch=True)
     
     #! Environment Experiments
     # process_experiment_group("environment", "exp_env", "length_", has_failed_experiments=True)
