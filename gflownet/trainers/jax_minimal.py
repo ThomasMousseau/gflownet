@@ -98,50 +98,35 @@ def train(agent, config):
     
     This mode requires a JAX-native environment (e.g., GridJAX).
     """
-    if agent is None:
-        # Instantiate minimal components needed for JAX training
-        print("Initializing JAX components from config...")
-        
-        # Logger
-        logger = instantiate(config.logger, config, _recursive_=False)
-        
-        # Proxy
-        proxy = instantiate(config.proxy, device=config.device, float_precision=config.float_precision)
-        
-        # Env
-        env = instantiate(config.env, device=config.device, float_precision=config.float_precision)
-        proxy.setup(env) # Setup proxy with env
-        
-        # Evaluator
-        evaluator = instantiate(config.evaluator)
-        
-        # Config values
-        n_train_steps = config.gflownet.optimizer.n_train_steps
-        batch_size = config.gflownet.optimizer.batch_size
-        
-        # Calculate train/sample ratios
-        train_to_sample_ratio = config.gflownet.optimizer.train_to_sample_ratio
-        ttsr = max(int(train_to_sample_ratio), 1)
-        sttr = max(int(1 / train_to_sample_ratio), 1)
-        
-        start_it = 0
-        use_context = False
-        jsd = False
-        device = config.device
-        
-    else:
-        env = agent.env
-        logger = agent.logger
-        proxy = agent.proxy
-        evaluator = agent.evaluator
-        n_train_steps = agent.n_train_steps
-        batch_size = agent.batch_size
-        sttr = agent.sttr
-        ttsr = agent.ttsr
-        start_it = agent.it
-        use_context = agent.use_context
-        jsd = agent.jsd
-        device = agent.device
+    # Instantiate minimal components needed for JAX training
+    print("Initializing JAX components from config...")
+    
+    # Logger
+    logger = instantiate(config.logger, config, _recursive_=False)
+    
+    # Proxy
+    proxy = instantiate(config.proxy, device=config.device, float_precision=config.float_precision)
+    
+    # Env
+    env = instantiate(config.env, device=config.device, float_precision=config.float_precision)
+    proxy.setup(env) # Setup proxy with env
+    
+    # Evaluator
+    evaluator = instantiate(config.evaluator)
+    
+    # Config values
+    n_train_steps = config.gflownet.optimizer.n_train_steps
+    batch_size = config.gflownet.optimizer.batch_size
+    
+    # Calculate train/sample ratios
+    train_to_sample_ratio = config.gflownet.optimizer.train_to_sample_ratio
+    ttsr = max(int(train_to_sample_ratio), 1)
+    sttr = max(int(1 / train_to_sample_ratio), 1)
+    
+    start_it = 0
+    use_context = False
+    jsd = False
+    device = config.device
 
     # Setup Optax optimizer with separate LR for logZ
     lr_schedule_main = optax.exponential_decay(
@@ -203,7 +188,7 @@ def train(agent, config):
     def jax_loss_and_grad(params, states, parents, actions, action_indices,
                          masks_forward, masks_backward, trajectory_indices,
                          actual_n_states, actual_n_trajs, actual_lengths, log_rewards, loss_type=loss_type):
-        """Compute loss and gradients for pure JAX batch."""
+
         if loss_type == 'trajectorybalance':
             # Combine params into models
             if 'forward_policy_trainable' in params and params['forward_policy_trainable'] is not None:
@@ -302,33 +287,11 @@ def train(agent, config):
         """
         Pure JAX implementation of the Corners proxy reward.
         states: (batch_size, n_dim) - normalized states in [-1, 1]
-        """
-        # PyTorch implementation uses abs(states) to map to positive quadrant
-        # and computes distance to mu * ones(n_dim).
-        # This is equivalent to finding the closest corner.
-        
+        """        
         mu_vec = mu * jnp.ones(n_dim)
-        
-        # Calculate negative squared Euclidean distance / (2 * sigma^2)
-        # states: (B, D)
-        # mu_vec: (D)
-        
-        # Use abs(states) to fold into positive quadrant
         diff = jnp.abs(states) - mu_vec[None, :]
         dist_sq = jnp.sum(diff**2, axis=-1)
-        
-        # Log probability
-        # PyTorch implementation uses sigma as the diagonal of the covariance matrix (variance)
-        # NOT as the standard deviation.
-        # cov = sigma * I
-        # inv(cov) = (1/sigma) * I
-        # term = -0.5 * (x-mu)^T * inv(cov) * (x-mu) = -0.5 * dist_sq / sigma
         log_prob = -0.5 * dist_sq / sigma
-        
-        # Normalization constant
-        # log(1 / sqrt((2*pi)^D * det(cov)))
-        # det(cov) = sigma^D
-        # log_norm = -0.5 * (D * log(2*pi) + D * log(sigma))
         log_norm = -0.5 * n_dim * jnp.log(2 * jnp.pi) - 0.5 * n_dim * jnp.log(sigma)
         
         return log_prob + log_norm

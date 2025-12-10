@@ -99,10 +99,6 @@ def estimate_total_time(history, framework, target_steps=5000, window=500, verbo
     n_logged_points = len(valid_history)
     actual_total = valid_history[metric_col].sum()
     
-    if verbose:
-        print(f"    Framework: {framework}, Max step: {max_step}, Logged points: {n_logged_points}")
-        print(f"    Metric sum: {actual_total:.2f}s, Avg per log: {actual_total/n_logged_points:.4f}s")
-    
     if max_step >= target_steps:
         return actual_total, actual_total, max_step, False
     
@@ -123,10 +119,6 @@ def estimate_total_time(history, framework, target_steps=5000, window=500, verbo
     
     estimated_missing_time = avg_time_per_iter * missing_points
     estimated_total = actual_total + estimated_missing_time
-    
-    if verbose:
-        print(f"    Missing steps: {target_steps - max_step}, Estimated extra: {estimated_missing_time:.2f}s")
-        print(f"    Estimated total: {estimated_total:.2f}s")
     
     return estimated_total, actual_total, max_step, True
 
@@ -159,9 +151,6 @@ def parse_run_info(run, param_prefix, verbose=False, use_wallclock=True):
     # Only process legacy (PyTorch) and jax-full frameworks
     if framework not in [FRAMEWORK_TORCH, FRAMEWORK_JAX]:
         return None
-
-    if verbose:
-        print(f"  Run: {run.name} (framework: {framework}, param: {param_value})")
 
     # Get wall-clock runtime from WandB summary
     wallclock_time = run.summary.get("_runtime", 0)
@@ -216,9 +205,7 @@ def parse_run_info(run, param_prefix, verbose=False, use_wallclock=True):
         "n_logged_points": len(history_table.dropna(subset=[METRIC_NAME_COMBINED])) if METRIC_NAME_COMBINED in history_table else 0,
     }
 
-def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_experiments=False, verbose=False, use_wallclock=True):
-    print(f"Processing group: {group_name} (Tag: {exp_tag}, Param: {param_prefix})")
-    print(f"  Using {'wall-clock time (_runtime)' if use_wallclock else 'logged time metrics'}")
+def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_experiments=False, verbose=False):
     api = wandb.Api()
     project_path = f"{WANDB_ENTITY}/{WANDB_PROJECT}"
     
@@ -229,7 +216,7 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
     
     data = []
     for run in runs:
-        info = parse_run_info(run, param_prefix, verbose=verbose, use_wallclock=use_wallclock)
+        info = parse_run_info(run, param_prefix, verbose=verbose, use_wallclock=True)
         if info:
             data.append(info)
             
@@ -243,63 +230,138 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
     
     filename_suffix = param_prefix.rstrip("_")
 
-    # ========== TABLE ==========
-    df_rows = []
-    grouped_data = defaultdict(lambda: defaultdict(list))
+    # ========== HELPER FUNCTION FOR TABLE GENERATION ==========
+    def generate_table(data, time_key, table_name):
+        """Generate a summary table using the specified time metric."""
+        df_rows = []
+        grouped_data = defaultdict(lambda: defaultdict(list))
+        
+        for item in data:
+            grouped_data[item["parameter"]][item["framework"]].append(item[time_key])
+
+        try:
+            sorted_params = sorted(grouped_data.keys(), key=lambda x: float(x))
+        except ValueError:
+            sorted_params = sorted(grouped_data.keys())
+
+        all_frameworks = set()
+        for item in data:
+            all_frameworks.add(item["framework"])
+        all_frameworks = sorted(list(all_frameworks))
+
+        for param in sorted_params:
+            frameworks = grouped_data[param]
+            row = {"Parameter": param}
+            
+            pytorch_mean = None
+            jax_mean = None
+            
+            for fw in all_frameworks:
+                times = frameworks.get(fw, [])
+                if times:
+                    mean = np.mean(times)
+                    std = np.std(times)
+                    row[f"{fw} Mean (s)"] = mean
+                    row[f"{fw} Std (s)"] = std
+                    
+                    # Track means for ratio calculation
+                    if fw == "PyTorch":
+                        pytorch_mean = mean
+                    elif fw == "Full JAX":
+                        jax_mean = mean
+                else:
+                    row[f"{fw} Mean (s)"] = np.nan
+                    row[f"{fw} Std (s)"] = np.nan
+            
+            # Calculate speedup ratio (PyTorch / JAX)
+            if pytorch_mean is not None and jax_mean is not None and jax_mean > 0:
+                row["Speedup (PyTorch/JAX)"] = pytorch_mean / jax_mean
+            else:
+                row["Speedup (PyTorch/JAX)"] = np.nan
+            
+            df_rows.append(row)
+        
+        return pd.DataFrame(df_rows)
+
+    # ========== TABLE 1: WALL-CLOCK TIME ==========
+    df_wallclock = generate_table(data, "wallclock_time", "Wall-clock")
+    wallclock_csv_path = os.path.join(output_dir, f"results_{filename_suffix}_wallclock.csv")
+    df_wallclock.to_csv(wallclock_csv_path, index=False)
+    print(f"Saved wall-clock table to {wallclock_csv_path}")
+    
+    print(f"\n{group_name} - Wall-clock Time (includes all overhead):")
+    print(df_wallclock.to_string(index=False))
+    print()
+
+    # ========== TABLE 2: LOGGED TIME (time_epoch / time_train+time_sample) ==========
+    df_logged = generate_table(data, "logged_time", "Logged")
+    logged_csv_path = os.path.join(output_dir, f"results_{filename_suffix}_logged.csv")
+    df_logged.to_csv(logged_csv_path, index=False)
+    print(f"Saved logged time table to {logged_csv_path}")
+    
+    print(f"\n{group_name} - Logged Time (time_epoch for JAX, time_train+time_sample for PyTorch):")
+    print(df_logged.to_string(index=False))
+    print()
+    
+    # ========== COMBINED SUMMARY TABLE ==========
+    # Show both metrics side by side for easy comparison
+    df_combined_rows = []
+    
+    try:
+        sorted_params = sorted(set(item["parameter"] for item in data), key=lambda x: float(x))
+    except ValueError:
+        sorted_params = sorted(set(item["parameter"] for item in data))
+    
+    grouped_wallclock = defaultdict(lambda: defaultdict(list))
+    grouped_logged = defaultdict(lambda: defaultdict(list))
     
     for item in data:
-        grouped_data[item["parameter"]][item["framework"]].append(item["total_time"])
-
-    try:
-        sorted_params = sorted(grouped_data.keys(), key=lambda x: float(x))
-    except ValueError:
-        sorted_params = sorted(grouped_data.keys())
-
-    all_frameworks = set()
-    for item in data:
-        all_frameworks.add(item["framework"])
-    all_frameworks = sorted(list(all_frameworks))
-
+        grouped_wallclock[item["parameter"]][item["framework"]].append(item["wallclock_time"])
+        grouped_logged[item["parameter"]][item["framework"]].append(item["logged_time"])
+    
     for param in sorted_params:
-        frameworks = grouped_data[param]
         row = {"Parameter": param}
         
-        pytorch_mean = None
-        jax_mean = None
-        
-        for fw in all_frameworks:
-            times = frameworks.get(fw, [])
-            if times:
-                mean = np.mean(times)
-                std = np.std(times)
-                row[f"{fw} Mean"] = mean
-                row[f"{fw} Std"] = std
-                
-                # Track means for ratio calculation
-                if fw == "PyTorch":
-                    pytorch_mean = mean
-                elif fw == "Full JAX":
-                    jax_mean = mean
+        # Wall-clock times
+        for fw in ["PyTorch", "Full JAX"]:
+            wc_times = grouped_wallclock[param].get(fw, [])
+            log_times = grouped_logged[param].get(fw, [])
+            
+            if wc_times:
+                row[f"{fw} Wallclock (s)"] = np.mean(wc_times)
             else:
-                row[f"{fw} Mean"] = np.nan
-                row[f"{fw} Std"] = np.nan
+                row[f"{fw} Wallclock (s)"] = np.nan
+                
+            if log_times:
+                row[f"{fw} Logged (s)"] = np.mean(log_times)
+            else:
+                row[f"{fw} Logged (s)"] = np.nan
         
-        # Calculate speedup ratio (PyTorch / JAX)
-        if pytorch_mean is not None and jax_mean is not None and jax_mean > 0:
-            row["Speedup (PyTorch/JAX)"] = pytorch_mean / jax_mean
+        # Speedup ratios
+        pt_wc = grouped_wallclock[param].get("PyTorch", [])
+        jax_wc = grouped_wallclock[param].get("Full JAX", [])
+        pt_log = grouped_logged[param].get("PyTorch", [])
+        jax_log = grouped_logged[param].get("Full JAX", [])
+        
+        if pt_wc and jax_wc and np.mean(jax_wc) > 0:
+            row["Speedup (Wallclock)"] = np.mean(pt_wc) / np.mean(jax_wc)
         else:
-            row["Speedup (PyTorch/JAX)"] = np.nan
+            row["Speedup (Wallclock)"] = np.nan
+            
+        if pt_log and jax_log and np.mean(jax_log) > 0:
+            row["Speedup (Logged)"] = np.mean(pt_log) / np.mean(jax_log)
+        else:
+            row["Speedup (Logged)"] = np.nan
         
-        df_rows.append(row)
-        
-    df_table = pd.DataFrame(df_rows)
-    output_csv_path = os.path.join(output_dir, f"results_{filename_suffix}_table.csv")
-    df_table.to_csv(output_csv_path, index=False)
-    print(f"Saved table to {output_csv_path}")
+        df_combined_rows.append(row)
     
-    # Print summary table
-    print(f"\n{group_name} - Summary:")
-    print(df_table.to_string(index=False))
+    df_combined = pd.DataFrame(df_combined_rows)
+    combined_csv_path = os.path.join(output_dir, f"results_{filename_suffix}_combined.csv")
+    df_combined.to_csv(combined_csv_path, index=False)
+    print(f"Saved combined table to {combined_csv_path}")
+    
+    print(f"\n{group_name} - Combined Summary (Wallclock vs Logged Time):")
+    print(df_combined.to_string(index=False))
     print()
     
     # Save detailed runs table for debugging
@@ -310,7 +372,6 @@ def process_experiment_group(group_name, exp_tag, param_prefix, has_failed_exper
             "Run Name": item["name"],
             "Framework": item["framework"],
             "Parameter": item["parameter"],
-            "Total Time (s)": item["total_time"],
             "Wallclock Time (s)": item["wallclock_time"],
             "Logged Time (s)": item["logged_time"],
             "Max Step": item["max_step"],
@@ -424,7 +485,7 @@ if __name__ == "__main__":
 
     #! Neural Networks Experiments
     #process_experiment_group("neural-nets", "exp_mlp", "nlayers_", has_failed_experiments=True)
-    process_experiment_group("neural-nets", "exp_mlp", "nhid_", verbose=True)
+    process_experiment_group("neural-nets", "exp_mlp", "nhid_", verbose=False)
     
     #! Environment Experiments
     # process_experiment_group("environment", "exp_env", "length_", has_failed_experiments=True)
