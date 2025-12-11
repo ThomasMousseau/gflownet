@@ -97,7 +97,6 @@ class JAXBatchConverter:
         actions = self.pad_and_convert(actions, self.max_states, name="actions")
         
         if pytorch_batch.proxy is None:
-            print("WARNING: Batch has no proxy, using zero rewards")
             terminating_rewards = torch.zeros(pytorch_batch.get_n_trajectories(), dtype=torch.float32, device=pytorch_batch.device)
         else:
             terminating_rewards = pytorch_batch.get_terminating_rewards(sort_by="trajectory")
@@ -415,11 +414,9 @@ def train(agent, config):
     elif hasattr(config.env, 'length') and hasattr(config.env, 'n_dim'):
         max_traj_len = config.env.length * config.env.n_dim
     else:
-        max_traj_len = 100 # Fallback
+        max_traj_len = 100 
         
     MAX_STATES = int(MAX_TRAJS * max_traj_len * 1.2) #! used to add a 20% buffer
-    
-    # MAX_STATES = config.env.length ** config.env.n_dim
     
     print(f"JAX Compilation Config: MAX_TRAJS={MAX_TRAJS}, MAX_STATES={MAX_STATES}")
 
@@ -551,8 +548,8 @@ def train(agent, config):
         time_train = t3 - t2
         time_sync = t4 - t3
         
-        if iteration % 10 == 0:
-            print(f"Iter {iteration}: Sample={time_sample:.4f}s, Convert={time_convert:.4f}s, Train={time_train:.4f}s, Sync={time_sync:.4f}s")
+        # if iteration % 100 == 0:
+        #     print(f"Iter {iteration}: Sample={time_sample:.4f}s, Convert={time_convert:.4f}s, Train={time_train:.4f}s, Sync={time_sync:.4f}s")
         
         # Logging WandB 
         if agent.evaluator.should_log_train(iteration):

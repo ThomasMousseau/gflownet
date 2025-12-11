@@ -1,6 +1,8 @@
 # GFlowNet JAX Implementation
 
-This project implements GFlowNet using JAX and benchmarks it against the legacy PyTorch implementation.
+Evaluating Deep Learning Frameworks for GFlowNets: JAX vs PyTorch
+
+Final reseach project for IFT6760B
 
 ## Main Changes
 - `gflownet/trainers/jax_minimal.py`: Minimal JAX trainer implementation.
