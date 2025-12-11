@@ -4,56 +4,236 @@ import jax.numpy as jnp
 import numpy as np
 from jax import jit, value_and_grad, grad
 import equinox as eqx
+import torch.nn as nn
+import torch
 import optax
 import gc
-from collections import defaultdict
+from functools import partial
 from tqdm import tqdm
-from gflownet.utils.common import instantiate
+from torch.utils.dlpack import to_dlpack as torch_to_dlpack
+from torch.utils.dlpack import from_dlpack as torch_from_dlpack
+from jax.dlpack import from_dlpack as jax_from_dlpack
+
+from gflownet.utils.common import instantiate, set_device
+from gflownet.utils.batch import Batch
+from gflownet.policy.base_jax import PolicyJAX
 from gflownet.utils.policy import parse_policy_config
-from gflownet.envs.grid_jax import (
-    sample_trajectories_jax,
-    states2proxy_jax,
-    states2policy_jax,
-)
+
+def t2j(tensor):
+    if isinstance(tensor, torch.Tensor):
+        return jnp.array(tensor.detach().cpu().numpy())
+    return jnp.array(tensor)
+
+def j2t(array):
+    return torch.from_numpy(np.array(array))
+
+class JAXBatchConverter:
+    def __init__(self, max_states, max_trajs, device):
+        self.max_states = max_states
+        self.max_trajs = max_trajs
+        self.device = device
+        self.buffers = {}
+
+    def pad_and_convert(self, tensor, size, fill_value=0, name=""):
+        curr_size = tensor.shape[0]
+        
+        if curr_size > size:
+            tensor = tensor[:size]
+            curr_size = size
+
+        key = name
+        if key not in self.buffers:
+            shape = list(tensor.shape)
+            shape[0] = size
+            self.buffers[key] = torch.full(shape, fill_value, dtype=tensor.dtype, device=self.device)
+        
+        buf = self.buffers[key]
+        
+        if buf.shape[1:] != tensor.shape[1:] or buf.dtype != tensor.dtype:
+             shape = list(tensor.shape)
+             shape[0] = size
+             buf = torch.full(shape, fill_value, dtype=tensor.dtype, device=self.device)
+             self.buffers[key] = buf
+        else:
+             buf.fill_(fill_value)
+
+        buf[:curr_size] = tensor
+        return t2j(buf)
+
+    def __call__(self, pytorch_batch: Batch):
+        """
+        Extract JAX-compatible arrays from PyTorch Batch using pre-allocated buffers.
+        """
+        
+        traj_indices = pytorch_batch.get_trajectory_indices(consecutive=True)
+        actual_n_trajs = int(traj_indices.max().item()) + 1
+        actual_n_states = len(pytorch_batch)
+        
+        traj_indices = self.pad_and_convert(traj_indices, self.max_states, fill_value=self.max_trajs, name="traj_indices") #! fill_value=self.max_trajs
+        
+        states_policy = pytorch_batch.get_states(policy=True)
+        if isinstance(states_policy, list):
+            if len(states_policy) > 0 and isinstance(states_policy[0], torch.Tensor):
+                states_policy = torch.stack(states_policy)
+            else:
+                states_policy = torch.tensor(np.array(states_policy), device=pytorch_batch.device)
+                
+        states = self.pad_and_convert(states_policy, self.max_states, name="states")
+        
+        actions = []
+        for i in range(len(pytorch_batch)):
+            action = pytorch_batch.actions[i]
+            traj_idx = pytorch_batch.traj_indices[i]
+            env = pytorch_batch.envs[traj_idx]
+            
+            if isinstance(action, tuple):
+                action_idx = env.action2index(action)
+            else:
+                action_idx = action
+            
+            actions.append(action_idx)
+        
+        actions = torch.tensor(actions, dtype=torch.int32, device=pytorch_batch.device)
+        actions = self.pad_and_convert(actions, self.max_states, name="actions")
+        
+        if pytorch_batch.proxy is None:
+            print("WARNING: Batch has no proxy, using zero rewards")
+            terminating_rewards = torch.zeros(pytorch_batch.get_n_trajectories(), dtype=torch.float32, device=pytorch_batch.device)
+        else:
+            terminating_rewards = pytorch_batch.get_terminating_rewards(sort_by="trajectory")
+        
+        terminating_rewards = self.pad_and_convert(terminating_rewards, self.max_trajs, name="terminating_rewards")
+        
+        rewards = pytorch_batch.get_rewards()
+        rewards = self.pad_and_convert(rewards, self.max_states, name="rewards")
+        
+        logrewards = pytorch_batch.get_terminating_rewards(log=True, sort_by="trajectory")
+        logrewards = self.pad_and_convert(logrewards, self.max_trajs, name="logrewards")
+        
+        logprobs_fwd, _ = pytorch_batch.get_logprobs(backward=False)
+        logprobs_bwd, _ = pytorch_batch.get_logprobs(backward=True)
+        
+        logprobs = self.pad_and_convert(logprobs_fwd, self.max_states, name="logprobs")
+        logprobs_rev = self.pad_and_convert(logprobs_bwd, self.max_states, name="logprobs_rev")
+        
+        parents_policy = pytorch_batch.get_parents(policy=True)
+        if isinstance(parents_policy, list):
+            if len(parents_policy) > 0 and isinstance(parents_policy[0], torch.Tensor):
+                parents_policy = torch.stack(parents_policy)
+            else:
+                parents_policy = torch.tensor(np.array(parents_policy), device=pytorch_batch.device)
+        
+        parents_policy = self.pad_and_convert(parents_policy, self.max_states, name="parents_policy")
+
+        masks_forward_pt = pytorch_batch.get_masks_forward(of_parents=True)
+        masks_backward_pt = pytorch_batch.get_masks_backward()
+        
+        masks_forward = self.pad_and_convert(masks_forward_pt, self.max_states, fill_value=1, name="masks_forward")
+        masks_backward = self.pad_and_convert(masks_backward_pt, self.max_states, fill_value=1, name="masks_backward")
+        
+        return {
+            'states': states,
+            'parents_policy': parents_policy,
+            'actions': actions,
+            'rewards': rewards,
+            'logprobs': logprobs,
+            'logprobs_rev': logprobs_rev,
+            'trajectory_indices': traj_indices,
+            'masks_forward': masks_forward,
+            'masks_backward': masks_backward,
+            
+            'terminating_rewards': terminating_rewards,
+            'logrewards': logrewards,
+            
+            'actual_n_states': jnp.array(actual_n_states, dtype=jnp.int32),
+            'actual_n_trajs': jnp.array(actual_n_trajs, dtype=jnp.int32),
+        }
 
 
-def init_agent_jax(config, env):
+def _match_linear_layers(pt_model, jax_model, context):
     """
-    Initialize JAX policies and parameters from configuration.
+    Return PyTorch Linear modules and matching JAX Linear layers (with indices).
+    Raises if the number of Linear layers does not match.
     """
-    float_precision = 32
-    device = "cpu"
-    
+    pt_linears = [layer for layer in pt_model if isinstance(layer, nn.Linear)]
+    jax_linears = [
+        (idx, layer)
+        for idx, layer in enumerate(jax_model.layers)
+        if isinstance(layer, eqx.nn.Linear)
+    ]
+    if len(pt_linears) != len(jax_linears):
+        raise ValueError(
+            f"{context}: mismatch in Linear layer count between PyTorch "
+            f"({len(pt_linears)}) and JAX ({len(jax_linears)}). Ensure MLP configs align."
+        )
+    return pt_linears, jax_linears
+
+
+def convert_params_to_jax(agent, config, key):
+
+    if isinstance(agent.float, torch.dtype):
+        if agent.float == torch.float16:
+            float_precision = 16
+        elif agent.float == torch.float32:
+            float_precision = 32
+        elif agent.float == torch.float64:
+            float_precision = 64
+        else:
+            float_precision = 32
+    else:
+        float_precision = agent.float
+
     jax_params = {}
     jax_policies = {}
     
-    # Forward Policy
     forward_config = parse_policy_config(config, kind="forward")
     forward_config = forward_config["config"]
     if forward_config is not None:
         forward_config["_target_"] = "gflownet.policy.base_jax.PolicyJAX"
-        forward_config["key"] = None
+        forward_config["key"] = None 
 
         jax_policy_f = instantiate(
             forward_config,
-            env=env,
-            device=device,
+            env=agent.env,
+            device=agent.device,
             float_precision=float_precision,
         )
         jax_policies["forward"] = jax_policy_f
 
-        if hasattr(jax_policy_f, 'model'):
-            trainable_f, static_f = eqx.partition(jax_policy_f.model, eqx.is_array)
+        if agent.forward_policy.is_model:
+            pt_model_f = agent.forward_policy.model          # nn.Sequential
+            jax_model_f = jax_policy_f.model                # Equinox Sequential
+
+            pt_linears_f, jax_linears_f = _match_linear_layers(
+                pt_model_f, jax_model_f, "Forward policy"
+            )
+
+            for pt_lin, (jax_idx, _) in zip(pt_linears_f, jax_linears_f):
+                jax_model_f = eqx.tree_at(
+                    lambda m, idx=jax_idx: m.layers[idx].weight,
+                    jax_model_f,
+                    jnp.array(pt_lin.weight.detach().cpu().numpy(), dtype=jnp.float32),
+                )
+                jax_model_f = eqx.tree_at(
+                    lambda m, idx=jax_idx: m.layers[idx].bias,
+                    jax_model_f,
+                    jnp.array(pt_lin.bias.detach().cpu().numpy(), dtype=jnp.float32),
+                )
+
+            jax_policy_f.model = jax_model_f
+
+            # Partition into trainable/static
+            trainable_f, static_f = eqx.partition(jax_model_f, eqx.is_array)
             jax_params["forward_policy_trainable"] = trainable_f
             jax_policies["forward_static"] = static_f
         else:
             jax_params["forward_policy_trainable"] = None
             jax_policies["forward_static"] = None
-            
-    # Backward Policy
+    
     backward_config = parse_policy_config(config, kind="backward")
     backward_config = backward_config["config"]
     if backward_config is not None:
+        # copy n_hid / n_layers if shared_weights
         if backward_config.get("shared_weights", False) and forward_config is not None:
             if "n_hid" in forward_config and "n_hid" not in backward_config:
                 backward_config["n_hid"] = forward_config["n_hid"]
@@ -66,8 +246,8 @@ def init_agent_jax(config, env):
 
         jax_policy_b = instantiate(
             backward_config,
-            env=env,
-            device=device,
+            env=agent.env,
+            device=agent.device,
             float_precision=float_precision,
             base=jax_policy_f
         )
@@ -77,63 +257,113 @@ def init_agent_jax(config, env):
 
         jax_policies["backward"] = jax_policy_b
 
-        if hasattr(jax_policy_b, 'model'):
-            trainable_b, static_b = eqx.partition(jax_policy_b.model, eqx.is_array)
+        if agent.backward_policy.is_model:
+            pt_model_b = agent.backward_policy.model        # now flat nn.Sequential
+            jax_model_b = jax_policy_b.model                # Equinox Sequential
+
+            pt_linears_b, jax_linears_b = _match_linear_layers(
+                pt_model_b, jax_model_b, "Backward policy"
+            )
+
+            for pt_lin, (jax_idx, _) in zip(pt_linears_b, jax_linears_b):
+                jax_model_b = eqx.tree_at(
+                    lambda m, idx=jax_idx: m.layers[idx].weight,
+                    jax_model_b,
+                    jnp.array(pt_lin.weight.detach().cpu().numpy(), dtype=jnp.float32),
+                )
+                jax_model_b = eqx.tree_at(
+                    lambda m, idx=jax_idx: m.layers[idx].bias,
+                    jax_model_b,
+                    jnp.array(pt_lin.bias.detach().cpu().numpy(), dtype=jnp.float32),
+                )
+
+            jax_policy_b.model = jax_model_b
+
+            trainable_b, static_b = eqx.partition(jax_model_b, eqx.is_array)
             jax_params["backward_policy_trainable"] = trainable_b
             jax_policies["backward_static"] = static_b
         else:
             jax_params["backward_policy_trainable"] = None
             jax_policies["backward_static"] = None
-
-    # LogZ
-    z_dim = config.gflownet.optimizer.z_dim
-    jax_params["logZ"] = jnp.ones(z_dim, dtype=jnp.float32) * 150.0 / 64.0
     
+    if agent.logZ is not None:
+        jax_params["logZ"] = jnp.array(agent.logZ.detach().cpu().numpy(), dtype=jnp.float32)
+    else:
+        jax_params["logZ"] = jnp.array(0.0, dtype=jnp.float32)
+
     return jax_params, jax_policies
 
+def apply_params_to_pytorch(jax_params, agent, jax_policies):
+    """
+    Copy JAX parameters back to PyTorch models.
+    Works with arbitrary-depth MLPs (Linear + activation repeats).
+    """
+    # Track updated layers to avoid overwriting shared weights
+    updated_modules = set()
+    
+    def _copy_model(pt_model, jax_model, context):
+        pt_linears, jax_linears = _match_linear_layers(pt_model, jax_model, context)
+
+        for pt_lin, (_, jax_lin) in zip(pt_linears, jax_linears):
+            if id(pt_lin) in updated_modules:
+                continue
+
+            w_t = j2t(jax_lin.weight)
+            with torch.no_grad():
+                pt_lin.weight.copy_(w_t)
+
+            b_t = j2t(jax_lin.bias)
+            with torch.no_grad():
+                pt_lin.bias.copy_(b_t)
+            
+            updated_modules.add(id(pt_lin))
+
+    try:
+        # ---------- FORWARD POLICY ----------
+        if (
+            "forward_policy_trainable" in jax_params
+            and jax_params["forward_policy_trainable"] is not None
+        ):
+            jax_model_f = eqx.combine(
+                jax_params["forward_policy_trainable"],
+                jax_policies["forward_static"],
+            )
+            pt_model_f = agent.forward_policy.model  # nn.Sequential
+            _copy_model(pt_model_f, jax_model_f, "Forward policy")
+
+        # ---------- BACKWARD POLICY ----------
+        if (
+            "backward_policy_trainable" in jax_params
+            and jax_params["backward_policy_trainable"] is not None
+        ):
+            jax_model_b = eqx.combine(
+                jax_params["backward_policy_trainable"],
+                jax_policies["backward_static"],
+            )
+            pt_model_b = agent.backward_policy.model  # nn.Sequential (flat now!)
+
+            _copy_model(pt_model_b, jax_model_b, "Backward policy")
+
+        # ---------- logZ ----------
+        if jax_params.get("logZ", None) is not None and agent.logZ is not None:
+            logZ_t = j2t(jax_params["logZ"])
+            agent.logZ.data.copy_(logZ_t)
+
+    except Exception as e:
+        print(f"Warning: Failed to sync JAX parameters back to PyTorch: {e}")
+        print("Continuing with JAX-only training (parameters won't be synced back)")
 
 def train(agent, config):
     """
-    Pure JAX trainer: Uses JAX for both sampling and training (end-to-end JIT).
-    
-    This mode requires a JAX-native environment (e.g., GridJAX).
+    Phase 1 JAX trainer: Uses PyTorch agent for sampling, JAX for backprop.
     """
-    # Instantiate minimal components needed for JAX training
-    print("Initializing JAX components from config...")
     
-    # Logger
-    logger = instantiate(config.logger, config, _recursive_=False)
-    
-    # Proxy
-    proxy = instantiate(config.proxy, device=config.device, float_precision=config.float_precision)
-    
-    # Env
-    env = instantiate(config.env, device=config.device, float_precision=config.float_precision)
-    proxy.setup(env) # Setup proxy with env
-    
-    # Evaluator
-    evaluator = instantiate(config.evaluator)
-    
-    # Config values
-    n_train_steps = config.gflownet.optimizer.n_train_steps
-    batch_size = config.gflownet.optimizer.batch_size
-    
-    # Calculate train/sample ratios
-    train_to_sample_ratio = config.gflownet.optimizer.train_to_sample_ratio
-    ttsr = max(int(train_to_sample_ratio), 1)
-    sttr = max(int(1 / train_to_sample_ratio), 1)
-    
-    start_it = 0
-    use_context = False
-    jsd = False
-    device = config.device
-
-    # Setup Optax optimizer with separate LR for logZ
+    # !Setup Optax optimizer with separate LR for logZ
     lr_schedule_main = optax.exponential_decay(
         init_value=config.gflownet.optimizer.lr,
         transition_steps=config.gflownet.optimizer.lr_decay_period,
         decay_rate=config.gflownet.optimizer.lr_decay_gamma,
-        staircase=True
+        staircase=True 
     )
 
     lr_schedule_logz = optax.exponential_decay(
@@ -143,12 +373,12 @@ def train(agent, config):
         staircase=True
     )
     
-    max_grad_norm = 1.0
+    max_grad_norm = 1.0  # Hard-coded, matching PyTorch
 
     optimizer = optax.multi_transform(
         {
             'main': optax.chain(
-                optax.clip_by_global_norm(max_grad_norm),
+                optax.clip_by_global_norm(max_grad_norm), 
                 optax.adam(
                     learning_rate=lr_schedule_main,
                     b1=config.gflownet.optimizer.adam_beta1,
@@ -160,7 +390,7 @@ def train(agent, config):
                 learning_rate=lr_schedule_logz,
                 b1=config.gflownet.optimizer.adam_beta1,
                 b2=config.gflownet.optimizer.adam_beta2,
-                eps=1e-8,
+                eps=1e-8, 
             ),
         },
         {
@@ -169,28 +399,33 @@ def train(agent, config):
             'logZ': 'logz'
         }
     )
+
     
     key = jax.random.PRNGKey(config.seed)
-    jax_params, jax_policies = init_agent_jax(config, env)
+    jax_params, jax_policies = convert_params_to_jax(agent, config, key)
     opt_state = optimizer.init(jax_params)
     loss_type = config.loss.get('_target_', 'trajectorybalance').split('.')[-1].lower()
     
-    # Environment config
-    grid_config = env.config
+    n_trajs_per_sample = agent.batch_size.forward + agent.batch_size.backward_dataset + agent.batch_size.backward_replay
+    MAX_TRAJS = int(n_trajs_per_sample * agent.sttr) 
     
-    # Batch size
-    n_trajs_per_sample = batch_size.forward + batch_size.backward_dataset + batch_size.backward_replay
-    n_trajs_total = int(n_trajs_per_sample * sttr)
+    max_traj_len = 0
+    if hasattr(config.env, 'max_step'):
+        max_traj_len = config.env.max_step
+    elif hasattr(config.env, 'length') and hasattr(config.env, 'n_dim'):
+        max_traj_len = config.env.length * config.env.n_dim
+    else:
+        max_traj_len = 100 # Fallback
+        
+    MAX_STATES = int(MAX_TRAJS * max_traj_len * 1.2) #! used to add a 20% buffer
     
-    print(f"Pure JAX Config: n_trajs_per_sample={n_trajs_per_sample}, sttr={sttr}, total={n_trajs_total}")
+    # MAX_STATES = config.env.length ** config.env.n_dim
     
-    # Loss function (will be JIT-compiled by jax_grad_step)
-    def jax_loss_and_grad(params, states, parents, actions, action_indices,
-                         masks_forward, masks_backward, trajectory_indices,
-                         actual_n_states, actual_n_trajs, actual_lengths, log_rewards, loss_type=loss_type):
+    print(f"JAX Compilation Config: MAX_TRAJS={MAX_TRAJS}, MAX_STATES={MAX_STATES}")
 
-        if loss_type == 'trajectorybalance':
-            # Combine params into models
+    @partial(jit, static_argnames=['loss_type', 'debug'])
+    def jax_loss_wrapper(params, batch_arrays, loss_type=loss_type, debug=False):
+        if loss_type == 'trajectorybalance': #TODO: implement different losses
             if 'forward_policy_trainable' in params and params['forward_policy_trainable'] is not None:
                 model_f = eqx.combine(params['forward_policy_trainable'], jax_policies['forward_static'])
             else:
@@ -202,428 +437,238 @@ def train(agent, config):
                 model_b = jax_policies['backward'].model
             
             logZ = params['logZ']
-            if logZ.ndim > 0:
-                logZ = jnp.sum(logZ)
-            
-            # Forward logits and logprobs
-            from gflownet.envs.grid_jax import states2policy_jax
-            states_policy = states2policy_jax(states, grid_config)
-            parents_policy = states2policy_jax(parents, grid_config)
-            
-            logits_f = jax.vmap(model_f)(parents_policy)
-            logits_f_masked = jnp.where(masks_forward, -jnp.inf, logits_f)
+            if logZ.ndim > 0: logZ = jnp.sum(logZ)
+                                
+            logits_f = jax.vmap(model_f)(batch_arrays['parents_policy'])
+            logits_f_masked = jnp.where(batch_arrays['masks_forward'], -jnp.inf, logits_f)
             logprobs_f_all = jax.nn.log_softmax(logits_f_masked, axis=1)
-            
-            # Get logprobs for taken actions
-            batch_size = states.shape[0]
-            logprobs_f = logprobs_f_all[jnp.arange(batch_size), action_indices]
-            
-            # Backward logits and logprobs
-            logits_b = jax.vmap(model_b)(states_policy)
-            logits_b_masked = jnp.where(masks_backward, -jnp.inf, logits_b)
+            logprobs_f = logprobs_f_all[jnp.arange(MAX_STATES), batch_arrays['actions']]
+
+            state_mask = jnp.arange(MAX_STATES) < batch_arrays['actual_n_states']
+            logprobs_f = logprobs_f * state_mask
+
+            logits_b = jax.vmap(model_b)(batch_arrays['states']) 
+            logits_b_masked = jnp.where(batch_arrays['masks_backward'], -jnp.inf, logits_b)
             logprobs_b_all = jax.nn.log_softmax(logits_b_masked, axis=1)
-            logprobs_b = logprobs_b_all[jnp.arange(batch_size), action_indices]
+            logprobs_b = logprobs_b_all[jnp.arange(MAX_STATES), batch_arrays['actions']]
+            logprobs_b = logprobs_b * state_mask
             
-            # Create state mask (valid states only)
-            # Note: states are flattened [traj0, traj1, ...] with padding at end of each traj
-            max_len = batch_size // actual_n_trajs
-            step_indices = jnp.arange(max_len)
-            mask_2d = step_indices[None, :] < actual_lengths[:, None]
-            state_mask = mask_2d.reshape(-1)
+            traj_indices = batch_arrays['trajectory_indices']
             
-            # Use where to avoid 0 * -inf = nan
-            logprobs_f = jnp.where(state_mask, logprobs_f, 0.0)
-            logprobs_b = jnp.where(state_mask, logprobs_b, 0.0)
-            
-            # Sum logprobs per trajectory
-            traj_indices = trajectory_indices
-            num_trajs = actual_n_trajs
-            
-            # Use segment_sum for trajectory-level aggregation
-            segment_ids = traj_indices + 1  # Offset by 1
-            num_segments = num_trajs + 1
+            segment_ids = traj_indices + 1  
+            num_segments = MAX_TRAJS + 1    
             
             sum_logprobs_f = jax.ops.segment_sum(logprobs_f, segment_ids, num_segments=num_segments)
             sum_logprobs_b = jax.ops.segment_sum(logprobs_b, segment_ids, num_segments=num_segments)
             
-            # Remove offset
             sum_logprobs_f = sum_logprobs_f[1:]
             sum_logprobs_b = sum_logprobs_b[1:]
             
-            # Compute trajectory balance loss
             logprob_ratios = sum_logprobs_f - sum_logprobs_b
+            
+            log_rewards = batch_arrays['logrewards']
+            
             losses = (logZ + logprob_ratios - log_rewards) ** 2
             
-            # Average over trajectories
-            traj_mask = jnp.arange(num_trajs) < actual_n_trajs
+            #! Average over actual trajectories and avoid division by zero
+            traj_mask = jnp.arange(MAX_TRAJS) < batch_arrays['actual_n_trajs']
             loss_sum = jnp.sum(losses * traj_mask)
-            loss = loss_sum / (jnp.sum(traj_mask) + 1e-8)
+            n_valid = jnp.sum(traj_mask)
+            return loss_sum / (n_valid + 1e-8)
             
-            return loss
-        
         return jnp.array(0.0)
     
-    def jax_grad_step(params, opt_state, states, parents, actions, action_indices,
-                     masks_forward, masks_backward, trajectory_indices,
-                     actual_n_states, actual_n_trajs, actual_lengths, log_rewards,
-                     optimizer, loss_type=loss_type):
-        """Gradient step for pure JAX (called inside scan)."""
+    @partial(jit, static_argnames=['optimizer','loss_type'])
+    def jax_grad_step(params, opt_state, batch_arrays, optimizer, loss_type=loss_type):
+        """
+        JIT-compiled gradient step.
+        This is the ONLY function that needs to be pure JAX.
+        """
         
-        loss_value, grads = value_and_grad(jax_loss_and_grad)(
-            params, states, parents, actions, action_indices,
-            masks_forward, masks_backward, trajectory_indices,
-            actual_n_states, actual_n_trajs, actual_lengths, log_rewards, loss_type=loss_type
+        loss_value, grads = value_and_grad(jax_loss_wrapper)(
+            params, batch_arrays, loss_type=loss_type
         )
+            
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
+        
         return new_params, new_opt_state, loss_value, grads
-
-    # Extract proxy config
-    proxy_mu = config.proxy.get("mu", 0.75)
-    proxy_sigma = config.proxy.get("sigma", 0.05)
-    proxy_n_dim = config.env.n_dim
-
-    def corners_reward_jax(states, mu, sigma, n_dim):
-        """
-        Pure JAX implementation of the Corners proxy reward.
-        states: (batch_size, n_dim) - normalized states in [-1, 1]
-        """        
-        mu_vec = mu * jnp.ones(n_dim)
-        diff = jnp.abs(states) - mu_vec[None, :]
-        dist_sq = jnp.sum(diff**2, axis=-1)
-        log_prob = -0.5 * dist_sq / sigma
-        log_norm = -0.5 * n_dim * jnp.log(2 * jnp.pi) - 0.5 * n_dim * jnp.log(sigma)
-        
-        return log_prob + log_norm
-
-    def compute_log_rewards_jax(batch, mu, sigma, n_dim):
-        """
-        Pure JAX reward computation.
-        """
-        states = batch.states
-        actual_lengths = batch.actual_lengths
-        
-        num_trajs = actual_lengths.shape[0]
-        total_states = states.shape[0]
-        max_len = total_states // num_trajs
-        
-        states_reshaped = states.reshape(num_trajs, max_len, -1)
-
-        # Extract terminal states
-        last_indices = jnp.clip(actual_lengths - 1, 0, max_len - 1)
-        
-        traj_ids = jnp.arange(num_trajs)
-        terminal_states = states_reshaped[traj_ids, last_indices]
-
-        # Convert to proxy input (normalize to [-1, 1])
-        grid_size = grid_config.length
-        proxy_inputs = (terminal_states / (grid_size - 1)) * 2.0 - 1.0
-        
-        log_rewards = corners_reward_jax(proxy_inputs, mu, sigma, n_dim)
-        log_rewards = jnp.maximum(log_rewards, -100.0) # Avoid -inf issues
-        
-        return log_rewards
-
-    @jit
-    def train_step(jax_params, opt_state, key):
-        """Single training step (sample + reward + train)."""
-        key, subkey = jax.random.split(key)
-        
-        # Reconstruct model for sampling
-        if 'forward_policy_trainable' in jax_params and jax_params['forward_policy_trainable'] is not None:
-            model_f = eqx.combine(jax_params['forward_policy_trainable'], jax_policies['forward_static'])
-        else:
-            model_f = jax_policies['forward'].model
-            
-        # Sample trajectories
-        batch, _ = sample_trajectories_jax(
-            key=subkey,
-            config=grid_config,
-            policy_model=model_f,
-            n_trajectories=n_trajs_total,
-            temperature=1.0,
-            return_logprobs=False
-        )
-        
-        # Compute rewards in JAX
-        log_rewards = compute_log_rewards_jax(batch, proxy_mu, proxy_sigma, proxy_n_dim)
-        
-        # Training updates (ttsr loop)
-        def update_body(carry_inner, _):
-            p, o = carry_inner
-            new_p, new_o, l, g = jax_grad_step(
-                p, o, 
-                batch.states, batch.parents, batch.actions, batch.action_indices,
-                batch.masks_forward, batch.masks_backward, batch.trajectory_indices,
-                batch.actual_n_states, batch.actual_n_trajs, batch.actual_lengths, 
-                log_rewards,
-                optimizer, loss_type
-            )
-            return (new_p, new_o), (l, g)
-            
-        # Loop over training steps ratio (ttsr)
-        if ttsr == 1:
-            (jax_params, opt_state), (loss, grads) = update_body((jax_params, opt_state), None)
-            step_losses = jnp.reshape(loss, (1,))
-        else:
-            (jax_params, opt_state), (step_losses, grads) = jax.lax.scan(
-                update_body, (jax_params, opt_state), None, length=ttsr
-            )
-        
-        grad_logZ_mean = jnp.mean(grads['logZ']) if grads['logZ'] is not None else 0.0
-        
-        first_layer_grad_norm = 0.0
-        if grads['forward_policy_trainable'] is not None:
-            leaves = jax.tree_util.tree_leaves(grads['forward_policy_trainable'])
-            if len(leaves) > 0:
-                first_layer_grad_norm = jnp.sqrt(jnp.sum(leaves[0] ** 2))
-        
-        traj_lengths = batch.actual_lengths
-        traj_len_mean = jnp.mean(traj_lengths)
-        traj_len_min = jnp.min(traj_lengths)
-        traj_len_max = jnp.max(traj_lengths)
-        metrics = {
-            'loss': jnp.mean(step_losses),
-            'traj_len_mean': traj_len_mean,
-            'traj_len_min': traj_len_min,
-            'traj_len_max': traj_len_max,
-            'grad_logZ_mean': grad_logZ_mean,
-            'first_layer_grad_norm': first_layer_grad_norm,
-        }
-        
-        return jax_params, opt_state, key, metrics, log_rewards
-
-    @jit
-    def train_epoch(jax_params, opt_state, key):
-        """Run a chunk of training steps fully JIT-compiled using scan."""
-        def body_fn(carry, _):
-            params, opt, k = carry
-            new_params, new_opt, new_k, metrics, log_rewards = train_step(params, opt, k)
-            return (new_params, new_opt, new_k), (metrics, log_rewards)
-
-        (jax_params, opt_state, key), (all_metrics, all_log_rewards) = jax.lax.scan(
-            body_fn, (jax_params, opt_state, key), None, length=steps_per_epoch
-        )
-        return jax_params, opt_state, key, all_metrics, all_log_rewards
-
-    # Training loop
-    steps_per_epoch = 1 #! I HAVE TO CHANGE THIS
-    n_epochs = (n_train_steps - start_it + 1) // steps_per_epoch
     
+    total_iterations = agent.n_train_steps - agent.it + 1
     pbar = tqdm(
-        initial=start_it,
-        total=n_train_steps,
-        disable=logger.progressbar.get("skip", False),
+        initial=agent.it - 1,
+        total=total_iterations,
+        disable=agent.logger.progressbar.get("skip", False),
     )
     
-    for epoch in range(n_epochs):
+    batch_converter = JAXBatchConverter(MAX_STATES, MAX_TRAJS, agent.device)
+
+    for iteration in range(agent.it, agent.n_train_steps + 1):
         
-        # Training model
         t0 = time.time()
-        jax_params, opt_state, key, all_metrics, all_log_rewards = train_epoch(jax_params, opt_state, key)
+        
+        batch = Batch(
+            env=agent.env,
+            proxy=agent.proxy,
+            device=agent.device,
+            float_type=agent.float,
+        )
+        
+        # Sample batch (PyTorch)
+        for _ in range(agent.sttr):
+            sub_batch, _ = agent.sample_batch(
+                n_forward=agent.batch_size.forward,
+                n_train=agent.batch_size.backward_dataset,
+                n_replay=agent.batch_size.backward_replay,
+                collect_forwards_masks=True,
+                collect_backwards_masks=agent.collect_backwards_masks,
+            )
+            batch.merge(sub_batch)
+        
         t1 = time.time()
         
-        avg_loss = float(jnp.mean(all_metrics['loss']))
-        current_step = start_it + (epoch + 1) * steps_per_epoch
-        lr_main = float(lr_schedule_main(current_step))
-        lr_logz = float(lr_schedule_logz(current_step))
-        logZ_value = float(jnp.sum(jax_params['logZ']))
-        
-        if evaluator.should_log_train(current_step):
-            metrics = {
-                "step": current_step,
-                "time_epoch": t1 - t0,
-                "steps_per_sec": steps_per_epoch / (t1 - t0),
-                "Loss": avg_loss,
-                "all": avg_loss,
-                "Trajectory lengths mean": float(jnp.mean(all_metrics['traj_len_mean'])),
-                "Trajectory lengths min": float(jnp.min(all_metrics['traj_len_min'])),
-                "Trajectory lengths max": float(jnp.max(all_metrics['traj_len_max'])),
-                "Batch size": n_trajs_total,
-                "logZ": logZ_value,
-                "Learning rate": lr_main,
-                "Learning rate logZ": lr_logz,
-                "grad_logZ_mean": float(jnp.mean(all_metrics['grad_logZ_mean'])),
-                "first_layer_grad_norm": float(jnp.mean(all_metrics['first_layer_grad_norm'])),
-            }
-            logger.log_metrics(metrics, step=current_step, use_context=use_context)
+        batch_arrays = batch_converter(batch)
+
+        t2 = time.time()
+
+        for _ in range(agent.ttsr):
+            jax_params, opt_state, loss_value, grads = jax_grad_step(
+                jax_params, opt_state, batch_arrays, optimizer, loss_type=loss_type
+            )
+        jax_params['forward_policy_trainable'][0].weight.block_until_ready() #To prevent async issues when benchmarking
+        jax_params['backward_policy_trainable'][0].weight.block_until_ready()
+        jax_params['logZ'].block_until_ready()
+
             
-        flat_rewards = jnp.exp(all_log_rewards).reshape(-1)
+        t3 = time.time()
         
-        logger.progressbar_update(
-            pbar,
-            avg_loss,
-            flat_rewards,
-            jsd,
-            use_context,
-        )
-        pbar.update(steps_per_epoch - 1)
+        apply_params_to_pytorch(jax_params, agent, jax_policies)
         
-        if evaluator.should_eval(current_step):
-            key, eval_key = jax.random.split(key)
-            if 'forward_policy_trainable' in jax_params and jax_params['forward_policy_trainable'] is not None:
-                model_f_eval = eqx.combine(jax_params['forward_policy_trainable'], jax_policies['forward_static'])
+        t4 = time.time()
+        
+        time_sample = t1 - t0
+        time_convert = t2 - t1
+        time_train = t3 - t2
+        time_sync = t4 - t3
+        
+        if iteration % 10 == 0:
+            print(f"Iter {iteration}: Sample={time_sample:.4f}s, Convert={time_convert:.4f}s, Train={time_train:.4f}s, Sync={time_sync:.4f}s")
+        
+        # Logging WandB 
+        if agent.evaluator.should_log_train(iteration):
+
+            rewards_np = np.asarray(batch_arrays["terminating_rewards"], dtype=np.float32)
+            logrewards_np = np.log(rewards_np + 1e-8)
+
+            rewards_t = torch.from_numpy(rewards_np)
+            logrewards_t = torch.from_numpy(logrewards_np)
+
+            proxy_vals = batch_arrays.get("terminating_scores", None)
+            if proxy_vals is not None:
+                proxy_vals_t = torch.from_numpy(np.asarray(proxy_vals, dtype=np.float32))
             else:
-                model_f_eval = jax_policies['forward'].model
-            
-            n_eval_samples = config.evaluator.get('n', 1000)
-            eval_batch, _ = sample_trajectories_jax(
-                key=eval_key,
-                config=grid_config,
-                policy_model=model_f_eval,
-                n_trajectories=n_eval_samples,
-                temperature=1.0,
-                return_logprobs=True  
+                proxy_vals_t = None
+
+            agent.logger.log_rewards_and_scores(
+                rewards=rewards_t,
+                logrewards=logrewards_t,
+                scores=proxy_vals_t,
+                step=iteration,
+                prefix="Train batch -",
+                use_context=agent.use_context,
             )
             
-            eval_lengths = eval_batch.actual_lengths
-            num_eval_trajs = eval_lengths.shape[0]
-            max_eval_len = eval_batch.states.shape[0] // num_eval_trajs
-            eval_states_reshaped = eval_batch.states.reshape(num_eval_trajs, max_eval_len, -1)
-            last_eval_indices = jnp.clip(eval_lengths - 1, 0, max_eval_len - 1)
-            terminal_states_eval = eval_states_reshaped[jnp.arange(num_eval_trajs), last_eval_indices]
+            # Explicitly delete intermediate tensors
+            del rewards_t, logrewards_t, proxy_vals_t, rewards_np, logrewards_np
+
+            traj_indices = batch_arrays.get("trajectory_indices", None)
+            if traj_indices is not None:
+                traj_indices = jnp.asarray(traj_indices)
+                _, counts = jnp.unique(traj_indices, return_counts=True)
+                counts = counts.astype(jnp.float32)
+
+                traj_length_mean = float(jnp.mean(counts))
+                traj_length_min  = float(jnp.min(counts))
+                traj_length_max  = float(jnp.max(counts))
+            else:
+                traj_length_mean = traj_length_min = traj_length_max = None
+
+            if "logZ" in jax_params:
+                logz = float(jnp.sum(jax_params["logZ"]))
+            else:
+                logz = None
+
+
+            lr_main = float(lr_schedule_main(iteration))
+            lr_logz = float(lr_schedule_logz(iteration))
+            grad_logZ = np.asarray(grads["logZ"], dtype=np.float32)
+
+            metrics = {
+                "step": iteration,
+                "Trajectory lengths mean": traj_length_mean,
+                "Trajectory lengths min": traj_length_min,
+                "Trajectory lengths max": traj_length_max,
+                "Batch size": len(batch),
+                "Batch_arrays size": batch_arrays['states'].shape[0],
+                "logZ": logz,
+                "Learning rate": lr_main,
+                "Learning rate logZ": lr_logz,
+                "grad_logZ_mean": float(grad_logZ.mean()),
+                "first_layer_grad_norm": float(jnp.linalg.norm(grads['forward_policy_trainable'].layers[0].weight)),
+                "time_sample": time_sample,
+                "time_convert": time_convert,
+                "time_train": time_train,
+                "time_sync": time_sync,
+            }
+
+            agent.logger.log_metrics(
+                metrics=metrics,
+                step=iteration,
+                use_context=agent.use_context,
+            )
+
+            losses = {
+                "all": float(loss_value),                 
+                "Loss": float(loss_value),               
+            }
+
+            agent.logger.log_metrics(
+                metrics=losses,
+                step=iteration,
+                use_context=agent.use_context,
+            )
             
-            #! Not sure about the calculation of the evaluation metrics below
-            
-            x_sampled = np.array(terminal_states_eval)
-            eval_metrics = {}
-            if hasattr(env, 'get_all_terminating_states'):
-                all_states = env.get_all_terminating_states()
-                x_tt = np.array(all_states)
-                
-                x_tt_proxy = (x_tt / (grid_config.length - 1)) * 2.0 - 1.0
-                
-                # Compute rewards using JAX corners function
-                rewards = np.exp(np.array(corners_reward_jax(
-                    jnp.array(x_tt_proxy), proxy_mu, proxy_sigma, proxy_n_dim
-                )))
-                z_true = rewards.sum()
-                density_true = rewards / z_true
-                
-                # Compute predicted density from samples histogram
-                hist = defaultdict(int)
-                for x in x_sampled:
-                    hist[tuple(x.tolist())] += 1
-                z_pred = sum([hist[tuple(x.tolist())] for x in x_tt]) + 1e-9
-                density_pred = np.array([hist[tuple(x.tolist())] / z_pred for x in x_tt])
-                
-                log_density_true = np.log(density_true + 1e-8)
-                log_density_pred = np.log(density_pred + 1e-8)
-                
-                # ==================== DENSITY METRICS ====================
-                # L1 error
-                l1 = np.abs(density_pred - density_true).mean()
-                # KL divergence
-                kl = (density_true * (log_density_true - log_density_pred)).mean()
-                # Jensen-Shannon divergence
-                log_mean_dens = np.logaddexp(log_density_true, log_density_pred) + np.log(0.5)
-                jsd_val = 0.5 * np.sum(density_true * (log_density_true - log_mean_dens))
-                jsd_val += 0.5 * np.sum(density_pred * (log_density_pred - log_mean_dens))
-                
-                eval_metrics["L1 error"] = l1
-                eval_metrics["KL Div."] = kl
-                eval_metrics["Jensen Shannon Div."] = jsd_val
-                
-                # ==================== LOG-PROB METRICS ====================
-                # Compute log probabilities for sampled trajectories
-                # We need to recompute log probs using the policy on the sampled states
-                
-                # Get sampled terminal states rewards
-                x_sampled_proxy = (x_sampled / (grid_config.length - 1)) * 2.0 - 1.0
-                sampled_rewards = np.exp(np.array(corners_reward_jax(
-                    jnp.array(x_sampled_proxy), proxy_mu, proxy_sigma, proxy_n_dim
-                )))
-                
-                # Compute log probs for each trajectory
-                # Vectorized approach: compute all log probs at once
-                eval_states_flat = eval_batch.states  # [n_trajs * max_len, n_dim]
-                eval_actions_flat = eval_batch.action_indices  # [n_trajs * max_len]
-                eval_masks_flat = eval_batch.masks_forward  # [n_trajs * max_len, n_actions]
-                
-                # Convert all states to policy format
-                all_states_policy = states2policy_jax(eval_states_flat, grid_config)
-                
-                # Get logits for all states using vmap
-                all_logits = jax.vmap(model_f_eval)(all_states_policy)
-                
-                # Apply masks and compute log probs
-                all_logits_masked = jnp.where(eval_masks_flat, -1e10, all_logits)
-                all_log_probs = jax.nn.log_softmax(all_logits_masked, axis=1)
-                
-                # Get log prob of taken action for each state
-                n_states_total = eval_states_flat.shape[0]
-                action_log_probs = all_log_probs[jnp.arange(n_states_total), eval_actions_flat]
-                
-                # Reshape to [n_trajs, max_len]
-                action_log_probs_2d = action_log_probs.reshape(num_eval_trajs, max_eval_len)
-                
-                # Create mask for valid steps
-                step_indices = np.arange(max_eval_len)[None, :]
-                valid_mask = step_indices < np.array(eval_lengths)[:, None]
-                
-                # Zero out padding and sum per trajectory
-                action_log_probs_2d = np.where(valid_mask, np.array(action_log_probs_2d), 0.0)
-                traj_log_probs = action_log_probs_2d.sum(axis=1)
-                
-                # NLL of test data (negative log likelihood)
-                nll_tt = -traj_log_probs.mean()
-                eval_metrics["NLL of test data"] = float(nll_tt)
-                
-                # Bootstrap std of log probs (simplified - using trajectory variance)
-                logprobs_std = np.std(traj_log_probs)
-                eval_metrics["Mean BS Std(logp)"] = float(logprobs_std)
-                
-                # Std of probs
-                probs = np.exp(np.clip(traj_log_probs, -50, 0))  # Clip to avoid overflow
-                probs_std = np.std(probs)
-                eval_metrics["Mean BS Std(p)"] = float(probs_std)
-                
-                # Correlation between trajectory probs and rewards
-                if len(sampled_rewards) > 1 and np.std(sampled_rewards) > 1e-10:
-                    corr = np.corrcoef(probs, sampled_rewards)[0, 1]
-                    if not np.isnan(corr):
-                        eval_metrics["Corr. (test probs., rewards)"] = float(corr)
-                
-                # Variance of (log rewards - log probs)
-                log_rewards = np.log(sampled_rewards + 1e-8)
-                var_logrewards_logp = np.var(log_rewards - traj_log_probs)
-                eval_metrics["Var(logR - logp) test"] = float(var_logrewards_logp)
-                
-                # Ratio of logprobs std to NLL
-                if abs(nll_tt) > 1e-10:
-                    logprobs_std_nll_ratio = logprobs_std / abs(nll_tt)
-                    eval_metrics["BS Std(logp) / NLL"] = float(logprobs_std_nll_ratio)
-                
-                logger.log_metrics(eval_metrics, step=current_step, use_context=use_context)
-                
-                # Plot reward samples
-                if hasattr(env, 'plot_reward_samples'):
-                    fig = env.plot_reward_samples(
-                        x_sampled_proxy,
-                        x_tt_proxy,
-                        rewards,
-                    )
-                    if fig is not None:
-                        logger.log_plots(
-                            {"True reward and GFlowNet samples": fig},
-                            step=current_step,
-                            use_context=use_context
-                        )
-                
-                print(f"\n[Eval @ step {current_step}] L1: {l1:.4f}, KL: {kl:.4f}, JSD: {jsd_val:.4f}, NLL: {nll_tt:.4f}")
-            
-        # Periodic GC
-        if epoch % 10 == 0:
+            del metrics, losses, grad_logZ
+
+        term_rewards_for_pbar = np.asarray(batch_arrays["terminating_rewards"], dtype=np.float32)
+        agent.logger.progressbar_update(
+            pbar,
+            float(loss_value),
+            term_rewards_for_pbar,
+            agent.jsd,
+            agent.use_context,
+        )
+        del term_rewards_for_pbar
+        
+        if agent.evaluator.should_eval(iteration):
+            agent.evaluator.eval_and_log(iteration)
+        
+        if hasattr(batch, 'envs'):
+            batch.envs = []
+        
+        del batch
+        del batch_arrays
+        
+        if iteration % 100 == 0:
+            batch_converter.buffers.clear()
             gc.collect()
-    
+
     pbar.close()
     
     print("\n" + "=" * 80)
-    print("PURE JAX TRAINING COMPLETE")
+    print("PHASE 1 TRAINING COMPLETE")
+    print(f"  Final loss: {loss_value:.4f}")
     print("=" * 80)
     
     jax.clear_caches()
     return agent
-
-
-
