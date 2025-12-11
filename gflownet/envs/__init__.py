@@ -18,4 +18,4 @@
 
 """
 
-__all__ = ["base", "grid", "aptamers"]
+__all__ = ["base", "grid", "grid_jax", "aptamers"]

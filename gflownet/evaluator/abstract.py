@@ -468,45 +468,16 @@ class AbstractEvaluator(metaclass=ABCMeta):
         else:
             return step % self.config.train_log_period == 0
 
-    # def should_eval(self, step):
-    #     """
-    #     Check if testing should be done at the current step. The decision is based on
-    #     the ``self.config.test.period`` attribute.
-
-    #     Set ``self.config.test.first_it`` to ``True`` if testing should be done at the
-    #     first iteration step. Otherwise, testing will be done aftter
-    #     ``self.config.test.period`` steps.
-
-    #     Set ``self.config.test.period`` to ``None`` or a negative value to disable
-    #     testing.
-
-    #     Parameters
-    #     ----------
-    #     step : int
-    #         Current iteration step.
-
-    #     Returns
-    #     -------
-    #     bool
-    #         True if testing should be done at the current step, False otherwise.
-    #     """
-    #     if self.config.period is None or self.config.period <= 0:
-    #         return False
-    #     elif step == 1 and self.config.first_it:
-    #         return True
-    #     else:
-    #         return step % self.config.period == 0
-        
     def should_eval(self, step):
         """
         Check if testing should be done at the current step. The decision is based on
-        the ``self.config.period`` attribute.
+        the ``self.config.test.period`` attribute.
 
-        Set ``self.config.first_it`` to ``True`` if testing should be done at the
-        first iteration step. Otherwise, testing will be done after
-        ``self.config.period`` steps.
+        Set ``self.config.test.first_it`` to ``True`` if testing should be done at the
+        first iteration step. Otherwise, testing will be done aftter
+        ``self.config.test.period`` steps.
 
-        Set ``self.config.period`` to ``None`` or a negative value to disable
+        Set ``self.config.test.period`` to ``None`` or a negative value to disable
         testing.
 
         Parameters
@@ -519,23 +490,48 @@ class AbstractEvaluator(metaclass=ABCMeta):
         bool
             True if testing should be done at the current step, False otherwise.
         """
-        from jax import lax
-        # Mirror the original logic exactly, but use JAX control flow for traced operations
         if self.config.period is None or self.config.period <= 0:
             return False
+        elif step == 1 and self.config.first_it:
+            return True
         else:
-            # Condition 1: step is a multiple of period
-            cond1 = (step % self.config.period) == 0
+            return step % self.config.period == 0
+        
+    # def should_eval(self, step):
+    #     """
+    #     Check if testing should be done at the current step. The decision is based on
+    #     the ``self.config.period`` attribute.
+
+    #     Set ``self.config.first_it`` to ``True`` if testing should be done at the
+    #     first iteration step. Otherwise, testing will be done after
+    #     ``self.config.period`` steps.
+
+    #     Set ``self.config.period`` to ``None`` or a negative value to disable
+    #     testing.
+
+    #     Parameters
+    #     ----------
+    #     step : int
+    #         Current iteration step.
+
+    #     Returns
+    #     -------
+    #     bool
+    #         True if testing should be done at the current step, False otherwise.
+    #     """
+    #     from jax import lax
+    #     if self.config.period is None or self.config.period <= 0:
+    #         return False
+    #     else:
+    #         cond1 = (step % self.config.period) == 0
+    #         cond2 = lax.cond(
+    #             step == 1,
+    #             lambda: self.config.first_it,
+    #             lambda: False
+    #         )
             
-            # Condition 2: step == 1 AND first_it is True (use lax.cond for traced step)
-            cond2 = lax.cond(
-                step == 1,
-                lambda: self.config.first_it,
-                lambda: False
-            )
-            
-            # Return True if either condition is met
-            return cond1 | cond2
+    #         # Return True if either condition is met
+    #         return cond1 | cond2
 
     def should_eval_top_k(self, step):
         """

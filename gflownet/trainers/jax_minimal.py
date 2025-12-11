@@ -7,6 +7,7 @@ import equinox as eqx
 import torch.nn as nn
 import torch
 import optax
+import gc
 from functools import partial
 from tqdm import tqdm
 from torch.utils.dlpack import to_dlpack as torch_to_dlpack
@@ -18,19 +19,13 @@ from gflownet.utils.batch import Batch
 from gflownet.policy.base_jax import PolicyJAX
 from gflownet.utils.policy import parse_policy_config
 
-# ============================================================================
-# PHASE 1: Minimal JAX - Only JIT the gradient step
-# ============================================================================
-
 def t2j(tensor):
-    """Convert PyTorch tensor to JAX array via DLPack (zero-copy if possible)."""
     if isinstance(tensor, torch.Tensor):
-        return jax_from_dlpack(tensor.detach().contiguous())
+        return jnp.array(tensor.detach().cpu().numpy())
     return jnp.array(tensor)
 
 def j2t(array):
-    """Convert JAX array to PyTorch tensor via DLPack (zero-copy if possible)."""
-    return torch_from_dlpack(array)
+    return torch.from_numpy(np.array(array))
 
 class JAXBatchConverter:
     def __init__(self, max_states, max_trajs, device):
@@ -41,11 +36,10 @@ class JAXBatchConverter:
 
     def pad_and_convert(self, tensor, size, fill_value=0, name=""):
         curr_size = tensor.shape[0]
-        if curr_size == size:
-            return t2j(tensor)
         
         if curr_size > size:
-            return t2j(tensor[:size])
+            tensor = tensor[:size]
+            curr_size = size
 
         key = name
         if key not in self.buffers:
@@ -55,7 +49,6 @@ class JAXBatchConverter:
         
         buf = self.buffers[key]
         
-        # Reallocate if shape mismatch (e.g. embedding dim changed? unlikely)
         if buf.shape[1:] != tensor.shape[1:] or buf.dtype != tensor.dtype:
              shape = list(tensor.shape)
              shape[0] = size
@@ -78,7 +71,6 @@ class JAXBatchConverter:
         
         traj_indices = self.pad_and_convert(traj_indices, self.max_states, fill_value=self.max_trajs, name="traj_indices") #! fill_value=self.max_trajs
         
-        # Get states for policy input
         states_policy = pytorch_batch.get_states(policy=True)
         if isinstance(states_policy, list):
             if len(states_policy) > 0 and isinstance(states_policy[0], torch.Tensor):
@@ -105,7 +97,6 @@ class JAXBatchConverter:
         actions = self.pad_and_convert(actions, self.max_states, name="actions")
         
         if pytorch_batch.proxy is None:
-            print("WARNING: Batch has no proxy, using zero rewards")
             terminating_rewards = torch.zeros(pytorch_batch.get_n_trajectories(), dtype=torch.float32, device=pytorch_batch.device)
         else:
             terminating_rewards = pytorch_batch.get_terminating_rewards(sort_by="trajectory")
@@ -193,16 +184,12 @@ def convert_params_to_jax(agent, config, key):
 
     jax_params = {}
     jax_policies = {}
-
-    # ------------------------------------------------------------------
-    # FORWARD POLICY
-    # ------------------------------------------------------------------
     
     forward_config = parse_policy_config(config, kind="forward")
     forward_config = forward_config["config"]
     if forward_config is not None:
         forward_config["_target_"] = "gflownet.policy.base_jax.PolicyJAX"
-        forward_config["key"] = None  # will be set internally
+        forward_config["key"] = None 
 
         jax_policy_f = instantiate(
             forward_config,
@@ -241,10 +228,6 @@ def convert_params_to_jax(agent, config, key):
         else:
             jax_params["forward_policy_trainable"] = None
             jax_policies["forward_static"] = None
-
-    # ------------------------------------------------------------------
-    # BACKWARD POLICY
-    # ------------------------------------------------------------------
     
     backward_config = parse_policy_config(config, kind="backward")
     backward_config = backward_config["config"]
@@ -301,10 +284,6 @@ def convert_params_to_jax(agent, config, key):
         else:
             jax_params["backward_policy_trainable"] = None
             jax_policies["backward_static"] = None
-
-    # ------------------------------------------------------------------
-    # logZ
-    # ------------------------------------------------------------------
     
     if agent.logZ is not None:
         jax_params["logZ"] = jnp.array(agent.logZ.detach().cpu().numpy(), dtype=jnp.float32)
@@ -328,7 +307,6 @@ def apply_params_to_pytorch(jax_params, agent, jax_policies):
             if id(pt_lin) in updated_modules:
                 continue
 
-            # JAX -> PyTorch (Zero Copy on GPU)
             w_t = j2t(jax_lin.weight)
             with torch.no_grad():
                 pt_lin.weight.copy_(w_t)
@@ -427,7 +405,6 @@ def train(agent, config):
     opt_state = optimizer.init(jax_params)
     loss_type = config.loss.get('_target_', 'trajectorybalance').split('.')[-1].lower()
     
-    #TODO: find the right sizes for states and trajectories
     n_trajs_per_sample = agent.batch_size.forward + agent.batch_size.backward_dataset + agent.batch_size.backward_replay
     MAX_TRAJS = int(n_trajs_per_sample * agent.sttr) 
     
@@ -437,11 +414,9 @@ def train(agent, config):
     elif hasattr(config.env, 'length') and hasattr(config.env, 'n_dim'):
         max_traj_len = config.env.length * config.env.n_dim
     else:
-        max_traj_len = 100 # Fallback
+        max_traj_len = 100 
         
-    MAX_STATES = int(MAX_TRAJS * max_traj_len * 1.2) # 20% buffer
-    
-    # MAX_STATES = config.env.length ** config.env.n_dim
+    MAX_STATES = int(MAX_TRAJS * max_traj_len * 1.2) #! used to add a 20% buffer
     
     print(f"JAX Compilation Config: MAX_TRAJS={MAX_TRAJS}, MAX_STATES={MAX_STATES}")
 
@@ -510,9 +485,6 @@ def train(agent, config):
         loss_value, grads = value_and_grad(jax_loss_wrapper)(
             params, batch_arrays, loss_type=loss_type
         )
-                
-        # loss_value = jax_loss_wrapper(params, batch_arrays, loss_type=loss_type, debug=True)
-        # grads = grad(lambda p: jax_loss_wrapper(p, batch_arrays, loss_type=loss_type, debug=False))(params)
             
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
@@ -560,7 +532,7 @@ def train(agent, config):
             jax_params, opt_state, loss_value, grads = jax_grad_step(
                 jax_params, opt_state, batch_arrays, optimizer, loss_type=loss_type
             )
-        jax_params['forward_policy_trainable'][0].weight.block_until_ready()
+        jax_params['forward_policy_trainable'][0].weight.block_until_ready() #To prevent async issues when benchmarking
         jax_params['backward_policy_trainable'][0].weight.block_until_ready()
         jax_params['logZ'].block_until_ready()
 
@@ -576,30 +548,17 @@ def train(agent, config):
         time_train = t3 - t2
         time_sync = t4 - t3
         
-        if iteration % 10 == 0:
-            print(f"Iter {iteration}: Sample={time_sample:.4f}s, Convert={time_convert:.4f}s, Train={time_train:.4f}s, Sync={time_sync:.4f}s")
+        # if iteration % 100 == 0:
+        #     print(f"Iter {iteration}: Sample={time_sample:.4f}s, Convert={time_convert:.4f}s, Train={time_train:.4f}s, Sync={time_sync:.4f}s")
         
-        #! Buffer
-        # states_term = batch.get_terminating_states(sort_by="trajectory")
-        # proxy_vals = batch.get_terminating_proxy_values(sort_by="trajectory")
-        # rewards = batch.get_terminating_rewards(sort_by="trajectory")
-        # actions_trajectories = batch.get_actions_trajectories()
-        
-        # # Update main buffer (if enabled)
-        # if agent.buffer.use_main_buffer:
-        #     agent.buffer.add(states_term, actions_trajectories, rewards, iteration, buffer="main")
-        
-        # # Update replay buffer
-        # agent.buffer.add(states_term, actions_trajectories, rewards, iteration, buffer="replay")
-        
-        #! Logging WandB 
+        # Logging WandB 
         if agent.evaluator.should_log_train(iteration):
 
-            rewards = jnp.asarray(batch_arrays["terminating_rewards"])
-            logrewards = jnp.log(rewards + 1e-8)
+            rewards_np = np.asarray(batch_arrays["terminating_rewards"], dtype=np.float32)
+            logrewards_np = np.log(rewards_np + 1e-8)
 
-            rewards_t    = torch.from_numpy(np.asarray(rewards, dtype=np.float32))
-            logrewards_t = torch.from_numpy(np.asarray(logrewards, dtype=np.float32))
+            rewards_t = torch.from_numpy(rewards_np)
+            logrewards_t = torch.from_numpy(logrewards_np)
 
             proxy_vals = batch_arrays.get("terminating_scores", None)
             if proxy_vals is not None:
@@ -615,6 +574,9 @@ def train(agent, config):
                 prefix="Train batch -",
                 use_context=agent.use_context,
             )
+            
+            # Explicitly delete intermediate tensors
+            del rewards_t, logrewards_t, proxy_vals_t, rewards_np, logrewards_np
 
             traj_indices = batch_arrays.get("trajectory_indices", None)
             if traj_indices is not None:
@@ -672,17 +634,31 @@ def train(agent, config):
                 step=iteration,
                 use_context=agent.use_context,
             )
-        
+            
+            del metrics, losses, grad_logZ
+
+        term_rewards_for_pbar = np.asarray(batch_arrays["terminating_rewards"], dtype=np.float32)
         agent.logger.progressbar_update(
             pbar,
             float(loss_value),
-            np.asarray(batch_arrays["terminating_rewards"], dtype=np.float32),
+            term_rewards_for_pbar,
             agent.jsd,
             agent.use_context,
         )
+        del term_rewards_for_pbar
         
         if agent.evaluator.should_eval(iteration):
             agent.evaluator.eval_and_log(iteration)
+        
+        if hasattr(batch, 'envs'):
+            batch.envs = []
+        
+        del batch
+        del batch_arrays
+        
+        if iteration % 100 == 0:
+            batch_converter.buffers.clear()
+            gc.collect()
 
     pbar.close()
     
@@ -691,4 +667,5 @@ def train(agent, config):
     print(f"  Final loss: {loss_value:.4f}")
     print("=" * 80)
     
+    jax.clear_caches()
     return agent

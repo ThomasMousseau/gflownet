@@ -3,7 +3,7 @@
 defaults:
   - override /env: tetris
   - override /gflownet: trajectorybalance
-   - override /loss: trajectorybalance
+  - override /loss: trajectorybalance
   - override /policy: mlp
   - override /proxy: tetris
   - override /logger: wandb
@@ -22,7 +22,9 @@ buffer:
 
 proxy:
   reward_function: exponential
-  beta: 10
+  reward_function_kwargs: #! We add to change this
+    beta: 10.0
+    alpha: 1.0
 
 gflownet:
   random_action_prob: 0.3

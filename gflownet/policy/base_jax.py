@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 from omegaconf import OmegaConf
-# ---- Base -------------------------------------------------------------------
+
 class ModelBaseJAX(ABC):
     def __init__(self, config, env, device, float_precision, base=None):
 
@@ -130,7 +130,6 @@ class PolicyJAX(ModelBaseJAX):
         batch = states.shape[0]
         return jnp.ones((batch, self.output_dim), dtype=self.dtype)
     
-# ---- Utilities --------------------------------------------------------------
 def to_jnp_dtype(precision) -> jnp.dtype:
     if isinstance(precision, jnp.dtype):
         return precision

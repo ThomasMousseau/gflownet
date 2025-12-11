@@ -8,10 +8,9 @@ import copy
 import gc
 import pickle
 import time
-from collections import defaultdict
 from functools import partial
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -20,8 +19,6 @@ from torchtyping import TensorType
 from tqdm import tqdm, trange
 
 from gflownet.envs.base import GFlowNetEnv
-from gflownet.evaluator.base import BaseEvaluator
-from gflownet.trainers.jax_minimal import convert_params_to_jax
 from gflownet.utils.batch import Batch, compute_logprobs_trajectories
 from gflownet.utils.common import (
     bootstrap_samples,
@@ -980,7 +977,6 @@ class GFlowNetAgent:
                     self.opt.step()
                     self.lr_scheduler.step()
                     self.norm_grad_foward_first_layer = torch.norm(self.forward_policy.model[0].weight.grad)
-                    # print(f"PyTorch grad_forward_layer0_norm: {torch.norm(self.forward_policy.model[0].weight.grad):.10f}")
                     self.opt.zero_grad()
                     batch.zero_logprobs()
                     
@@ -988,11 +984,6 @@ class GFlowNetAgent:
             t2 = time.time()
                 
             times = self.log_train_iteration(pbar, losses, batch, times)
-
-            # Log times
-            # t1_iter = time.time()
-            # times.update({"iter": t1_iter - t0_iter})
-            # self.logger.log_time(times, use_context=self.use_context)
             
             time_sample = t1 - t0
             time_train = t2 - t1
@@ -1004,8 +995,8 @@ class GFlowNetAgent:
                 step=self.it,
                 use_context=self.use_context,
             )
-            
-            print(f"Iteration: {self.it} sampling time: {time_sample:.4f}s, training time: {time_train:.4f}s")
+             
+            # print(f"Iteration: {self.it} sampling time: {time_sample:.4f}s, training time: {time_train:.4f}s")
 
             # Garbage collection and cleanup GPU memory
             if (
